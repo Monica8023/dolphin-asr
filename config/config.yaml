@@ -1,0 +1,20 @@
+intent_service_url: "http://127.0.0.1:8808"
+business_callback_url: "http://127.0.0.1:19000/callback"
+interrupt_url: "http://127.0.0.1:19000/interrupt"
+
+# VAD 打断：检测到连续说话超过此时长触发无意图打断
+vad_interrupt_threshold_ms: 2000
+# 打断功能开关
+interrupt_enabled: true
+
+# 停顿最大时长：静音超过此时长判定一句话结束，触发 Intent 调用
+silence_max_ms: 800
+
+# 客户无应答时长：连接后超过此时长未收到有效文本，推送无应答指令
+no_answer_timeout_ms: 10000
+
+# 客户匹配时长：有文本输入但未命中意图，超过此时长流转兜底
+match_timeout_ms: 15000
+
+log_path: "./log"
+log_level: "INFO"

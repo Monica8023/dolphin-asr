@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "jenkins": {
+      "type": "http",
+      "url": "http://tools.zhulie.com/jenkins/mcp-server/mcp",
+      "headers": {
+        "Authorization": "Basic <test:1178d3d12180f74708a145d0b3666d2f0a>"
+      }
+    }
+  }
+}
