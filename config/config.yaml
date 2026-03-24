@@ -8,7 +8,7 @@ vad_interrupt_threshold_ms: 2000
 interrupt_enabled: true
 
 # 停顿最大时长：静音超过此时长判定一句话结束，触发 Intent 调用
-silence_max_ms: 800
+silence_max_ms: 350
 
 # 客户无应答时长：连接后超过此时长未收到有效文本，推送无应答指令
 no_answer_timeout_ms: 10000
@@ -24,6 +24,8 @@ asr_model_path: "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-v
 vad_model_path: "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 asr_device: "cpu"
 # 流式推理分块参数：[lookback, current, lookahead]（单位：LFR 帧，1帧≈60ms）
-asr_chunk_size: [0, 10, 5]
-asr_encoder_chunk_look_back: 4
-asr_decoder_chunk_look_back: 1
+asr_chunk_size: [0, 6, 2]
+asr_encoder_chunk_look_back: 2
+asr_decoder_chunk_look_back: 0
+intent_epoch_guard_enabled: true
+asr_workers: 8

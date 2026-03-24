@@ -14,7 +14,7 @@ DEFAULT_CONFIG = {
     "interrupt_url": "http://127.0.0.1:9000/interrupt",
     "vad_interrupt_threshold_ms": 2000,
     "interrupt_enabled": True,
-    "silence_max_ms": 800,
+    "silence_max_ms": 350,
     "no_answer_timeout_ms": 10000,
     "match_timeout_ms": 15000,
     "log_path": "./log",
@@ -22,9 +22,11 @@ DEFAULT_CONFIG = {
     "asr_model_path": "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
     "vad_model_path": "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
     "asr_device": "cpu",
-    "asr_chunk_size": [0, 10, 5],
-    "asr_encoder_chunk_look_back": 4,
-    "asr_decoder_chunk_look_back": 1,
+    "asr_chunk_size": [0, 6, 2],
+    "asr_encoder_chunk_look_back": 2,
+    "asr_decoder_chunk_look_back": 0,
+    "intent_epoch_guard_enabled": True,
+    "asr_workers": 8,
 }
 
 _config: dict[str, Any] = {}

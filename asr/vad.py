@@ -16,8 +16,9 @@ def load_vad_model() -> None:
     from config import nacos_config as cfg
 
     model_path = cfg.get("vad_model_path")
-    logger.info("Loading VAD model from %s", model_path)
-    _vad_model = AutoModel(model=model_path, device="cpu", disable_update=True)
+    device = cfg.get("asr_device", "cpu")
+    logger.info("Loading VAD model from %s on device=%s", model_path, device)
+    _vad_model = AutoModel(model=model_path, device=device, disable_update=True)
     logger.info("VAD model loaded.")
 
 
@@ -61,12 +62,8 @@ class VADDetector:
         rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
         return rms > 500
 
-    def process(self, audio_bytes: bytes) -> bool:
-        """
-        喂入一帧音频，返回 True 表示本次触发打断（连续说话超过阈值，且只触发一次）。
-        """
-        speech = self.is_speech(audio_bytes)
-
+    def process_speech(self, speech: bool) -> bool:
+        """基于已计算出的 speech 状态更新打断计时，返回是否触发打断。"""
         if speech:
             if self._speech_start is None:
                 self._speech_start = time.monotonic()
@@ -78,7 +75,8 @@ class VADDetector:
                 self._interrupted = True
                 logger.info(
                     "VAD: continuous speech %.0f ms >= threshold %d ms, triggering interrupt",
-                    elapsed_ms, self.threshold_ms,
+                    elapsed_ms,
+                    self.threshold_ms,
                 )
                 return True
         else:
@@ -88,3 +86,9 @@ class VADDetector:
             self._interrupted = False
 
         return False
+
+    def process(self, audio_bytes: bytes) -> bool:
+        """
+        喂入一帧音频，返回 True 表示本次触发打断（连续说话超过阈值，且只触发一次）。
+        """
+        return self.process_speech(self.is_speech(audio_bytes))

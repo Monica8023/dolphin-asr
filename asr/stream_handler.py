@@ -40,6 +40,7 @@ class StreamHandler:
         # 当前句子文本缓冲
         self._sentence_parts: list[str] = []
         self._sentence_start_ms: int = 0
+        self._sentence_epoch: int = 0
 
         # 全量转写片段
         self._all_segments: list[dict[str, Any]] = []
@@ -53,6 +54,7 @@ class StreamHandler:
         self._no_answer_task: asyncio.Task | None = None
         self._match_timeout_task: asyncio.Task | None = None
         self._first_text_received: bool = False
+        self._no_answer_sent: bool = False
 
     def start_timers(self) -> None:
         """连接建立后调用，启动无应答计时器。"""
@@ -110,20 +112,20 @@ class StreamHandler:
 
         loop = asyncio.get_running_loop()
 
-        # 1. 打断检测（process 内部已含 is_speech 判断）
+        # 1. 单次 VAD 语音判定（后续打断与停顿逻辑复用）
+        is_speech = await loop.run_in_executor(self._executor, self._vad.is_speech, audio_bytes)
+        logger.debug("call_id=%s step1 is_speech=%s", self.call_id, is_speech)
+
+        # 1.5 打断检测（基于 step1 的 is_speech，不重复跑 VAD）
         if cfg.get("interrupt_enabled", True):
-            logger.debug("call_id=%s step1 interrupt check start", self.call_id)
-            should_interrupt = await loop.run_in_executor(self._executor, self._vad.process, audio_bytes)
-            logger.debug("call_id=%s step1 interrupt check result: should_interrupt=%s", self.call_id, should_interrupt)
+            logger.debug("call_id=%s step1.5 interrupt check start", self.call_id)
+            should_interrupt = await loop.run_in_executor(self._executor, self._vad.process_speech, is_speech)
+            logger.debug("call_id=%s step1.5 interrupt check result: should_interrupt=%s", self.call_id, should_interrupt)
             if should_interrupt:
-                logger.info("call_id=%s step1 interrupt triggered", self.call_id)
+                logger.info("call_id=%s step1.5 interrupt triggered", self.call_id)
                 asyncio.create_task(self._send_interrupt())
         else:
-            logger.debug("call_id=%s step1 interrupt check skipped: interrupt_enabled=false", self.call_id)
-
-        # 停顿检测用 is_speech
-        is_speech = await loop.run_in_executor(self._executor, self._vad.is_speech, audio_bytes)
-        logger.debug("call_id=%s step1.5 is_speech=%s", self.call_id, is_speech)
+            logger.debug("call_id=%s step1.5 interrupt check skipped: interrupt_enabled=false", self.call_id)
 
         # 2. 流式 ASR 转写（每帧送入，模型内部积累足够 chunk 后返回文本）
         logger.debug("call_id=%s step2 asr transcribe start", self.call_id)
@@ -170,9 +172,12 @@ class StreamHandler:
                     self._sentence_start_ms = end_ms
                     self._in_speech = False
                     self._last_speech_end_ms = None
+                    self._sentence_epoch += 1
+                    sentence_epoch = self._sentence_epoch
+                    self._reset_sentence_state()
                     logger.info("call_id=%s step3 sentence done (silence %dms): %s", self.call_id, silence_ms, sentence)
-                    logger.info("call_id=%s step3 intent task scheduled", self.call_id)
-                    asyncio.create_task(self._call_intent(sentence))
+                    logger.info("call_id=%s step3 intent task scheduled (epoch=%d)", self.call_id, sentence_epoch)
+                    asyncio.create_task(self._call_intent(sentence, sentence_epoch))
 
         self._elapsed_ms = end_ms
         logger.debug("call_id=%s handle_audio end: elapsed_ms=%d", self.call_id, self._elapsed_ms)
@@ -181,10 +186,10 @@ class StreamHandler:
     #  Intent                                                              #
     # ------------------------------------------------------------------ #
 
-    async def _call_intent(self, sentence: str) -> None:
+    async def _call_intent(self, sentence: str, sentence_epoch: int | None = None) -> None:
         url = f"{cfg.get('intent_service_url')}/api/v1/recognize"
         payload = {"text": sentence, "call_id": str(self.call_id)}
-        logger.debug("call_id=%s step3 intent payload=%s", self.call_id, payload)
+        logger.debug("call_id=%s step3 intent payload=%s epoch=%s", self.call_id, payload, sentence_epoch)
         try:
             resp = await self._http_client.post(url, json=payload)
             resp.raise_for_status()
@@ -193,14 +198,20 @@ class StreamHandler:
             logger.warning("call_id=%s intent call failed: %s", self.call_id, e)
             return
 
+        if cfg.get("intent_epoch_guard_enabled", True) and sentence_epoch is not None and sentence_epoch != self._sentence_epoch:
+            logger.info(
+                "call_id=%s intent result ignored: stale epoch result=%s current=%s",
+                self.call_id,
+                sentence_epoch,
+                self._sentence_epoch,
+            )
+            return
+
         intent_id = data.get("intent_id", "intent_unknown")
-        logger.info("call_id=%s intent_id=%s text=%r", self.call_id, intent_id, sentence)
+        logger.info("call_id=%s intent_id=%s text=%r epoch=%s", self.call_id, intent_id, sentence, sentence_epoch)
 
         if intent_id != "intent_unknown":
             await self._send_callback(intent_id)
-
-        self._reset_sentence_state()
-        logger.info("call_id=%s sentence state reset, ready for next sentence", self.call_id)
 
     # ------------------------------------------------------------------ #
     #  对外推送                                                             #
@@ -247,11 +258,11 @@ class StreamHandler:
     async def _no_answer_timer(self) -> None:
         timeout_s = cfg.get("no_answer_timeout_ms", 10000) / 1000
         await asyncio.sleep(timeout_s)
-        if not self._paused:
+        if not self._paused and not self._no_answer_sent:
             logger.info("call_id=%s no_answer timeout (%.1fs)", self.call_id, timeout_s)
             await self._send_no_answer()
+            self._no_answer_sent = True
             self._reset_sentence_state()
-            self.start_timers()
 
     async def _match_timer(self) -> None:
         timeout_s = cfg.get("match_timeout_ms", 15000) / 1000

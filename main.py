@@ -17,7 +17,7 @@ from asr.stream_handler import StreamHandler
 logger = logging.getLogger(__name__)
 
 # P0-fix-1: 全局线程池，供 run_in_executor 执行 CPU 密集型推理
-_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("ASR_WORKERS", "4")))
+_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("ASR_WORKERS", str(cfg.get("asr_workers", 8)))))
 
 
 class IntentTestRequest(BaseModel):
@@ -58,7 +58,7 @@ app = FastAPI(title="dolphin-asr", lifespan=lifespan)
 @app.post("/test/intent")
 async def test_intent(req: IntentTestRequest) -> dict[str, Any]:
     logger.info(f"Test intent {req.text} callId {req.call_id}")
-    if os.environ.get("TEST_INTENT_ENABLED", "true").lower() != "true":
+    if os.environ.get("TEST_INTENT_ENABLED", "false").lower() != "true":
         raise HTTPException(status_code=404, detail="not found")
 
 
