@@ -1,8 +1,24 @@
+import struct
 import time
 import logging
-import struct
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_vad_model = None
+
+
+def load_vad_model() -> None:
+    """Load FunASR FSMN-VAD model. Path is read from config."""
+    global _vad_model
+    from funasr import AutoModel
+    from config import nacos_config as cfg
+
+    model_path = cfg.get("vad_model_path")
+    logger.info("Loading VAD model from %s", model_path)
+    _vad_model = AutoModel(model=model_path, device="cpu", disable_update=True)
+    logger.info("VAD model loaded.")
 
 
 class VADDetector:
@@ -12,15 +28,35 @@ class VADDetector:
         self.threshold_ms = threshold_ms
         self._speech_start: float | None = None
         self._interrupted = False
+        self._vad_cache: dict = {}
 
     def reset(self) -> None:
         self._speech_start = None
         self._interrupted = False
+        self._vad_cache = {}
 
     def is_speech(self, audio_bytes: bytes) -> bool:
-        """判断当前帧是否为语音（能量阈值，待替换为真实 VAD）。"""
+        """判断当前帧是否为语音。优先使用 FSMN-VAD，不可用时降级为能量阈值。"""
         if len(audio_bytes) < 2:
             return False
+
+        if _vad_model is not None:
+            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            chunk_ms = max(1, len(audio_np) // 16)
+            try:
+                result = _vad_model.generate(
+                    input=audio_np,
+                    cache=self._vad_cache,
+                    is_final=False,
+                    chunk_size=chunk_ms,
+                    disable_pbar=True,
+                )
+                # result[0]["value"] 为语音时间戳列表，非空即为语音帧
+                return bool(result and result[0].get("value"))
+            except Exception as e:
+                logger.warning("FSMN-VAD inference failed, fallback to energy: %s", e)
+
+        # 能量阈值降级
         samples = struct.unpack_from(f"{len(audio_bytes) // 2}h", audio_bytes)
         rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
         return rms > 500

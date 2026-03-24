@@ -19,6 +19,12 @@ DEFAULT_CONFIG = {
     "match_timeout_ms": 15000,
     "log_path": "./log",
     "log_level": "INFO",
+    "asr_model_path": "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+    "vad_model_path": "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    "asr_device": "cpu",
+    "asr_chunk_size": [0, 10, 5],
+    "asr_encoder_chunk_look_back": 4,
+    "asr_decoder_chunk_look_back": 1,
 }
 
 _config: dict[str, Any] = {}

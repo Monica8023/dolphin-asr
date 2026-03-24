@@ -1,238 +1,457 @@
 """
-/ws/asr 接口功能演示客户端
+/ws/asr 本地验证客户端（文件流 + 合成流 + 麦克风实时流）
 
-用法：
-    python demo_ws_client.py [--host 127.0.0.1] [--port 8080] [--call-id 1001]
-                             [--intent-port 8808] [--mock-port 9000]
-                             [--intent-text 我要转账] [--intent-id intent_transfer]
+示例：
+  # 1) 用 wav 文件（自动转 16k/mono/s16le）
+  python demo_ws_client.py --host 127.0.0.1 --port 8080 --call-id 1001 --wav-file ./sample.wav
 
-演示内容：
-    1. 启动本地 Mock HTTP 服务（:9000，接收 callback / interrupt 推送）
-    2. 启动本地 Mock Intent 服务（:8808，模拟意图识别，返回命中结果）
-    3. 连接 WebSocket /ws/asr?call_id=<id>&uuid=<id>
-    4. 发送模拟 PCM 音频帧（有声帧触发 VAD，静音帧触发停顿检测 → Intent 调用）
-    5. Intent 服务返回命中意图 → 服务端推送 callback → demo 打印结果
+  # 2) 用已准备好的 pcm（16kHz, 16-bit, mono, little-endian）
+  python demo_ws_client.py --host 127.0.0.1 --port 8080 --call-id 1001 --pcm-file ./sample.pcm
+
+  # 3) 不带文件，发送 2 秒正弦 + 1 秒静音（用于打断/停顿链路联调）
+  python demo_ws_client.py --host 127.0.0.1 --port 8080 --call-id 1001 --synthetic-seconds 2 --synthetic-silence-seconds 1
+
+  # 4) 麦克风实时流
+  python demo_ws_client.py --mic --host 127.0.0.1 --port 8080 --call-id 1001 --chunk-ms 60
 
 依赖：
-    pip install websockets
+  pip install websockets
+  # 使用 --wav-file 时需系统可用 ffmpeg
+  # 使用 --mic 时需安装 sounddevice
 """
 
 import argparse
 import asyncio
-import json
 import logging
 import math
+import os
 import struct
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Optional
 
+import numpy as np
 import websockets
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("demo")
-
-# ──────────────────────────────────────────────
-# 全局配置（由 argparse 填充）
-# ──────────────────────────────────────────────
-
-MOCK_PORT = 19000      # callback / interrupt 接收端口
-INTENT_PORT = 18808    # mock intent 服务端口
-INTENT_TEXT = "我要转账"   # 模拟 ASR 识别出的文本（注入到 engine.transcribe）
-INTENT_ID = "intent_transfer"  # mock intent 服务返回的意图 ID
-
-received_events: list[dict] = []
-
-
-# ──────────────────────────────────────────────
-# Mock HTTP 服务：callback / interrupt
-# ──────────────────────────────────────────────
-
-class MockCallbackHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        try:
-            data = json.loads(body)
-        except Exception:
-            data = {"raw": body.decode(errors="replace")}
-
-        received_events.append({"path": self.path, "data": data})
-        logger.info("[CALLBACK] POST %s  %s", self.path, json.dumps(data, ensure_ascii=False))
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"code":0}')
-
-    def log_message(self, fmt, *args):
-        pass
-
-
-# ──────────────────────────────────────────────
-# Mock Intent 服务：/api/v1/recognize
-# ──────────────────────────────────────────────
-
-class MockIntentHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        try:
-            req = json.loads(body)
-        except Exception:
-            req = {}
-
-        text = req.get("text", "")
-        # 只要文本非空就返回命中意图（模拟真实意图识别）
-        if text:
-            intent_id = INTENT_ID
-            logger.info("[INTENT]  text=%r  → intent_id=%s", text, intent_id)
-        else:
-            intent_id = "intent_unknown"
-            logger.info("[INTENT]  text=''  → intent_unknown")
-
-        resp = json.dumps({"intent_id": intent_id, "text": text}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(resp)
-
-    def log_message(self, fmt, *args):
-        pass
-
-
-def _start(handler_cls, port: int, label: str):
-    server = HTTPServer(("0.0.0.0", port), handler_cls)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    logger.info("%s listening on :%d", label, port)
-
-
-# ──────────────────────────────────────────────
-# PCM 音频帧生成
-# ──────────────────────────────────────────────
-
 SAMPLE_RATE = 16000
-FRAME_MS = 20
-FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 320 samples
-FRAME_BYTES = FRAME_SAMPLES * 2                  # 16-bit PCM
+BYTES_PER_SAMPLE = 2  # s16le
+DEFAULT_CHUNK_MS = 60
+
+logger = logging.getLogger("ws-demo")
 
 
-def make_silence_frame() -> bytes:
-    return bytes(FRAME_BYTES)
+def setup_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
 
-def make_speech_frame(freq: float = 440.0, amplitude: int = 8000) -> bytes:
-    """正弦波，RMS ≈ 5657，远超 VAD 阈值 500"""
-    samples = [
-        int(amplitude * math.sin(2 * math.pi * freq * i / SAMPLE_RATE))
-        for i in range(FRAME_SAMPLES)
+def build_ws_url(host: str, port: int, call_id: int, uuid: int) -> str:
+    return f"ws://{host}:{port}/ws/asr?call_id={call_id}&uuid={uuid}"
+
+
+def frame_bytes(chunk_ms: int, sample_rate: int = SAMPLE_RATE) -> int:
+    return sample_rate * chunk_ms // 1000 * BYTES_PER_SAMPLE
+
+
+def wav_to_pcm_s16le_mono_16k(wav_file: Path, ffmpeg_bin: str) -> Path:
+    fd, tmp_path = tempfile.mkstemp(prefix="ws_demo_", suffix=".pcm")
+    os.close(fd)
+    pcm_path = Path(tmp_path)
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i",
+        str(wav_file),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "s16le",
+        str(pcm_path),
     ]
-    return struct.pack(f"{FRAME_SAMPLES}h", *samples)
+    logger.info("Converting wav -> pcm via ffmpeg: %s", wav_file)
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return pcm_path
 
 
-# ──────────────────────────────────────────────
-# 注入 engine.transcribe（让占位实现返回文本）
-# ──────────────────────────────────────────────
-
-def _patch_engine(text: str):
-    """
-    engine.transcribe 是占位实现，始终返回 ""。
-    这里在 demo 进程内直接替换，让有声帧期间返回指定文本，
-    模拟真实 ASR 识别结果，从而触发 Intent 调用流程。
-    """
-    import asr.engine as engine_mod
-
-    _call_count = {"n": 0}
-
-    def fake_transcribe(audio_bytes: bytes) -> str:
-        # 每 10 帧（200ms）返回一次文本，避免刷屏
-        _call_count["n"] += 1
-        if _call_count["n"] % 10 == 0:
-            return text
-        return ""
-
-    engine_mod.transcribe = fake_transcribe
-    logger.info("[PATCH] engine.transcribe patched → returns %r every 10 frames", text)
+def generate_speech_frame(chunk_ms: int, freq_hz: float = 440.0, amplitude: int = 9000) -> bytes:
+    samples = SAMPLE_RATE * chunk_ms // 1000
+    vals = [
+        int(amplitude * math.sin(2.0 * math.pi * freq_hz * i / SAMPLE_RATE))
+        for i in range(samples)
+    ]
+    return struct.pack(f"{samples}h", *vals)
 
 
-# ──────────────────────────────────────────────
-# WebSocket 客户端
-# ──────────────────────────────────────────────
+def generate_silence_frame(chunk_ms: int, sample_rate: int = SAMPLE_RATE) -> bytes:
+    return bytes(frame_bytes(chunk_ms, sample_rate=sample_rate))
 
-async def run_demo(host: str, port: int, call_id: int):
-    url = f"ws://{host}:{port}/ws/asr?call_id={call_id}&uuid={call_id}"
-    logger.info("Connecting to %s", url)
+
+def list_microphone_devices() -> None:
+    try:
+        import sounddevice as sd
+    except ImportError as e:
+        raise RuntimeError("sounddevice 未安装，请先执行: pip install sounddevice") from e
+
+    devices = sd.query_devices()
+    try:
+        default_input = sd.default.device[0]
+    except (TypeError, IndexError):
+        default_input = sd.default.device if isinstance(sd.default.device, int) else None
+
+    print("\n可用音频设备（输入通道>0）:")
+    for idx, dev in enumerate(devices):
+        if dev.get("max_input_channels", 0) <= 0:
+            continue
+        mark = " (default)" if idx == default_input else ""
+        print(
+            f"  [{idx}] {dev.get('name')}"
+            f" | in={dev.get('max_input_channels')}"
+            f" | sr={dev.get('default_samplerate')}{mark}"
+        )
+
+
+def _normalize_device_arg(device: Optional[str]) -> Optional[int | str]:
+    if device is None:
+        return None
+    text = device.strip()
+    if text == "":
+        return None
+    if text.isdigit():
+        return int(text)
+    return text
+
+
+async def stream_pcm_file(
+    ws,
+    pcm_file: Path,
+    chunk_ms: int,
+    realtime: bool,
+) -> tuple[int, int]:
+    sent_frames = 0
+    sent_bytes = 0
+    chunk_size = frame_bytes(chunk_ms)
+
+    with pcm_file.open("rb") as f:
+        while True:
+            data = f.read(chunk_size)
+            if not data:
+                break
+            await ws.send(data)
+            sent_frames += 1
+            sent_bytes += len(data)
+            if realtime:
+                await asyncio.sleep(chunk_ms / 1000)
+
+    return sent_frames, sent_bytes
+
+
+async def stream_synthetic(
+    ws,
+    chunk_ms: int,
+    realtime: bool,
+    speech_seconds: float,
+    silence_seconds: float,
+) -> tuple[int, int]:
+    sent_frames = 0
+    sent_bytes = 0
+
+    speech_frames = int((speech_seconds * 1000) // chunk_ms)
+    silence_frames = int((silence_seconds * 1000) // chunk_ms)
+
+    logger.info("Synthetic stream: speech_frames=%d silence_frames=%d", speech_frames, silence_frames)
+
+    for _ in range(speech_frames):
+        data = generate_speech_frame(chunk_ms)
+        await ws.send(data)
+        sent_frames += 1
+        sent_bytes += len(data)
+        if realtime:
+            await asyncio.sleep(chunk_ms / 1000)
+
+    for _ in range(silence_frames):
+        data = generate_silence_frame(chunk_ms)
+        await ws.send(data)
+        sent_frames += 1
+        sent_bytes += len(data)
+        if realtime:
+            await asyncio.sleep(chunk_ms / 1000)
+
+    return sent_frames, sent_bytes
+
+
+def _resample_mono(mono_f32: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """线性插值重采样（不引入额外依赖）。mono_f32: float32 一维数组。"""
+    if src_rate == dst_rate:
+        return mono_f32
+    src_len = len(mono_f32)
+    dst_len = int(src_len * dst_rate / src_rate)
+    if dst_len == 0:
+        return np.zeros(0, dtype=np.float32)
+    src_idx = np.linspace(0, src_len - 1, dst_len, dtype=np.float64)
+    lo = src_idx.astype(np.int64)
+    hi = np.clip(lo + 1, 0, src_len - 1)
+    frac = (src_idx - lo).astype(np.float32)
+    return mono_f32[lo] * (1.0 - frac) + mono_f32[hi] * frac
+
+
+async def stream_microphone(
+    ws,
+    chunk_ms: int,
+    device: Optional[str],
+    duration_seconds: Optional[float],
+    device_sample_rate: int,
+    channels: int,
+) -> tuple[int, int]:
+    try:
+        import sounddevice as sd
+    except ImportError as e:
+        raise RuntimeError("sounddevice 未安装，请先执行: pip install sounddevice") from e
+
+    if channels < 1:
+        raise ValueError("--mic-channels 必须 >= 1")
+
+    selected_device = _normalize_device_arg(device)
+
+    # 自动探测设备原生采样率
+    if device_sample_rate == SAMPLE_RATE:
+        dev_info = sd.query_devices(selected_device, kind="input") if selected_device is not None else sd.query_devices(kind="input")
+        native_rate = int(dev_info.get("default_samplerate", SAMPLE_RATE))
+        if native_rate != SAMPLE_RATE:
+            logger.info(
+                "Device native sample_rate=%d != target %d, will resample in callback",
+                native_rate, SAMPLE_RATE,
+            )
+    else:
+        native_rate = device_sample_rate
+
+    # 按设备原生采样率计算每次回调读取的帧数（对应 chunk_ms 时长）
+    native_samples_per_chunk = native_rate * chunk_ms // 1000
+    # 目标帧长（16kHz, chunk_ms）
+    target_samples_per_chunk = SAMPLE_RATE * chunk_ms // 1000
+    target_frame_bytes = target_samples_per_chunk * BYTES_PER_SAMPLE
+
+    # 重采样后的 PCM 碎片缓冲（处理重采样后帧长不整除的情况）
+    pcm_buffer = bytearray()
+    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+    loop = asyncio.get_running_loop()
+    dropped_frames = 0
+
+    def audio_callback(indata, frames, _time_info, status):
+        nonlocal dropped_frames
+        if status:
+            logger.warning("Microphone status: %s", status)
+
+        # 转 float32，downmix 到单声道
+        data_f32 = indata.astype(np.float32, copy=False)
+        if data_f32.ndim == 2 and data_f32.shape[1] > 1:
+            mono_f32 = data_f32.mean(axis=1)
+        else:
+            mono_f32 = data_f32.ravel()
+
+        # 能量监控：RMS 转换为 int16 量纲（0~32767），方便对照 VAD 阈值 500
+        rms = float(np.sqrt(np.mean(mono_f32 ** 2))) * 32767
+        logger.debug("mic rms=%.0f (vad threshold ~500)", rms)
+
+        # 重采样到 16kHz
+        resampled = _resample_mono(mono_f32, native_rate, SAMPLE_RATE)
+
+        # 转 int16 little-endian bytes，追加到缓冲
+        pcm_chunk = (resampled * 32767.0).clip(-32768, 32767).astype("<i2").tobytes()
+        pcm_buffer.extend(pcm_chunk)
+
+        # 按 target_frame_bytes 切帧放入队列
+        def _flush_buffer() -> None:
+            nonlocal dropped_frames
+            while len(pcm_buffer) >= target_frame_bytes:
+                frame = bytes(pcm_buffer[:target_frame_bytes])
+                del pcm_buffer[:target_frame_bytes]
+                if queue.full():
+                    dropped_frames += 1
+                else:
+                    queue.put_nowait(frame)
+
+        loop.call_soon_threadsafe(_flush_buffer)
+
+    stream_kwargs = {
+        "samplerate": native_rate,
+        "blocksize": native_samples_per_chunk,
+        "dtype": "float32",
+        "channels": channels,
+        "callback": audio_callback,
+    }
+    if selected_device is not None:
+        stream_kwargs["device"] = selected_device
+
+    logger.info(
+        "Microphone streaming started: device=%s native_rate=%d target_rate=%d channels=%d chunk_ms=%d",
+        selected_device if selected_device is not None else "default",
+        native_rate,
+        SAMPLE_RATE,
+        channels,
+        chunk_ms,
+    )
+
+    sent_frames = 0
+    sent_bytes = 0
+    started = time.monotonic()
+
+    with sd.InputStream(**stream_kwargs):
+        while True:
+            if duration_seconds is not None and (time.monotonic() - started) >= duration_seconds:
+                break
+            data = await asyncio.wait_for(queue.get(), timeout=1.5)
+            await ws.send(data)
+            sent_frames += 1
+            sent_bytes += len(data)
+
+    logger.info(
+        "Microphone streaming ended: frames=%d bytes=%d dropped_frames=%d",
+        sent_frames,
+        sent_bytes,
+        dropped_frames,
+    )
+    return sent_frames, sent_bytes
+
+
+def validate_source_args(args: argparse.Namespace) -> None:
+    source_count = int(bool(args.mic)) + int(bool(args.wav_file)) + int(bool(args.pcm_file))
+    if source_count > 1:
+        raise ValueError("--mic / --wav-file / --pcm-file 只能选择一种输入源")
+
+
+async def run(args: argparse.Namespace) -> None:
+    validate_source_args(args)
+
+    if args.list_mic_devices:
+        list_microphone_devices()
+        return
+
+    ws_url = build_ws_url(args.host, args.port, args.call_id, args.uuid)
+    logger.info("Connecting: %s", ws_url)
+
+    pcm_path: Path | None = None
+    temp_pcm: Path | None = None
+
+    if args.pcm_file:
+        pcm_path = Path(args.pcm_file)
+        if not pcm_path.exists():
+            raise FileNotFoundError(f"PCM file not found: {pcm_path}")
+
+    if args.wav_file:
+        wav_path = Path(args.wav_file)
+        if not wav_path.exists():
+            raise FileNotFoundError(f"WAV file not found: {wav_path}")
+        temp_pcm = wav_to_pcm_s16le_mono_16k(wav_path, args.ffmpeg_bin)
+        pcm_path = temp_pcm
 
     try:
-        async with websockets.connect(url, ping_interval=None) as ws:
-            logger.info("Connected.")
+        async with websockets.connect(ws_url, ping_interval=None, max_size=None) as ws:
+            logger.info("WebSocket connected")
 
-            # Phase 1：1s 有声帧 → ASR 产生文本，启动 match_timeout 计时器
-            logger.info("--- Phase 1: 1s speech (ASR text generated) ---")
-            for _ in range(50):   # 50 * 20ms = 1s
-                await ws.send(make_speech_frame())
-                await asyncio.sleep(0.02)
+            if args.mic:
+                frames, total_bytes = await stream_microphone(
+                    ws=ws,
+                    chunk_ms=args.chunk_ms,
+                    device=args.mic_device,
+                    duration_seconds=args.mic_duration_seconds,
+                    device_sample_rate=args.mic_sample_rate,
+                    channels=args.mic_channels,
+                )
+            elif pcm_path:
+                logger.info("Streaming PCM file: %s", pcm_path)
+                frames, total_bytes = await stream_pcm_file(ws, pcm_path, args.chunk_ms, args.realtime)
+            else:
+                frames, total_bytes = await stream_synthetic(
+                    ws=ws,
+                    chunk_ms=args.chunk_ms,
+                    realtime=args.realtime,
+                    speech_seconds=args.synthetic_seconds,
+                    silence_seconds=args.synthetic_silence_seconds,
+                )
 
-            # Phase 2：1s 静音 → 停顿检测触发（silence_max_ms=800ms）→ 整句推 Intent
-            logger.info("--- Phase 2: 1s silence (sentence end → Intent call) ---")
-            for _ in range(50):
-                await ws.send(make_silence_frame())
-                await asyncio.sleep(0.02)
+            # 默认行为：文件流不补尾静音；mic/合成流补 1000ms（可用 --tail-silence-ms 覆盖）
+            effective_tail_silence_ms = args.tail_silence_ms
+            if effective_tail_silence_ms is None:
+                effective_tail_silence_ms = 0 if pcm_path else 1000
 
-            # Phase 3：等待 Intent 响应 + callback 推送
-            logger.info("--- Phase 3: waiting for intent callback (up to 3s) ---")
-            for _ in range(30):
-                await asyncio.sleep(0.1)
-                if any(ev["path"] == "/callback" for ev in received_events):
-                    logger.info("Intent callback received, done.")
-                    break
+            if effective_tail_silence_ms > 0:
+                tail_frames = effective_tail_silence_ms // args.chunk_ms
+                logger.info("Sending tail silence: %d ms (%d frames)", effective_tail_silence_ms, tail_frames)
+                for _ in range(tail_frames):
+                    data = generate_silence_frame(args.chunk_ms, sample_rate=args.mic_sample_rate if args.mic else SAMPLE_RATE)
+                    await ws.send(data)
+                    frames += 1
+                    total_bytes += len(data)
+                    if args.realtime:
+                        await asyncio.sleep(args.chunk_ms / 1000)
 
-            logger.info("Closing connection.")
+            # 默认行为：文件流不额外等待；mic/合成流等待 1000ms（可用 --wait-after-send-ms 覆盖）
+            effective_wait_after_send_ms = args.wait_after_send_ms
+            if effective_wait_after_send_ms is None:
+                effective_wait_after_send_ms = 0 if pcm_path else 1000
 
-    except ConnectionRefusedError:
-        logger.error("Connection refused — is the server running at %s:%d?", host, port)
-        return
-    except Exception as e:
-        logger.error("WebSocket error: %s", e)
-        return
+            if effective_wait_after_send_ms > 0:
+                logger.info("Waiting %d ms for server side flush/intent", effective_wait_after_send_ms)
+                await asyncio.sleep(effective_wait_after_send_ms / 1000)
 
-    print("\n" + "=" * 55)
-    print(f"Demo complete. Received {len(received_events)} event(s):")
-    for i, ev in enumerate(received_events, 1):
-        print(f"  [{i}] {ev['path']}  {json.dumps(ev['data'], ensure_ascii=False)}")
-    print("=" * 55)
+            stream_ms = frames * args.chunk_ms
+            logger.info(
+                "Done. frames=%d bytes=%d approx_audio_ms=%d",
+                frames,
+                total_bytes,
+                stream_ms,
+            )
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
+    finally:
+        if temp_pcm and temp_pcm.exists():
+            temp_pcm.unlink(missing_ok=True)
 
 
-# ──────────────────────────────────────────────
-# 入口
-# ──────────────────────────────────────────────
-
-def main():
-    global MOCK_PORT, INTENT_PORT, INTENT_TEXT, INTENT_ID
-
-    parser = argparse.ArgumentParser(description="dolphin-asr /ws/asr demo")
-    parser.add_argument("--host", default="127.0.0.1", help="ASR server host")
-    parser.add_argument("--port", type=int, default=8080, help="ASR server port")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="/ws/asr 本地语音流验证客户端")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--call-id", type=int, default=1001)
-    parser.add_argument("--mock-port", type=int, default=9000, help="callback/interrupt mock port")
-    parser.add_argument("--intent-port", type=int, default=8808, help="mock intent service port")
-    parser.add_argument("--intent-text", default="我要转账", help="text injected into engine.transcribe")
-    parser.add_argument("--intent-id", default="intent_transfer", help="intent_id returned by mock intent service")
-    args = parser.parse_args()
+    parser.add_argument("--uuid", type=int, default=0)
 
-    MOCK_PORT = args.mock_port
-    INTENT_PORT = args.intent_port
-    INTENT_TEXT = args.intent_text
-    INTENT_ID = args.intent_id
+    parser.add_argument("--pcm-file", help="16kHz/16-bit/mono/little-endian PCM 文件路径")
+    parser.add_argument("--wav-file", help="WAV 文件路径（将自动用 ffmpeg 转 PCM）")
+    parser.add_argument("--ffmpeg-bin", default="ffmpeg", help="ffmpeg 可执行文件路径")
 
-    _patch_engine(INTENT_TEXT)
-    _start(MockCallbackHandler, MOCK_PORT, "Mock callback/interrupt server")
-    _start(MockIntentHandler, INTENT_PORT, "Mock intent server")
+    parser.add_argument("--mic", action="store_true", help="启用麦克风实时流")
+    parser.add_argument("--mic-device", help="麦克风设备 ID 或名称", default= "1")
+    parser.add_argument("--mic-duration-seconds", type=float, help="麦克风采集时长（秒），不填表示直到 Ctrl+C")
+    parser.add_argument("--mic-sample-rate", type=int, default=16000, help="麦克风采样率（默认 16000）")
+    parser.add_argument("--mic-channels", type=int, default=1, help="麦克风输入通道数（默认 1）")
+    parser.add_argument("--list-mic-devices", action="store_true", help="列出可用麦克风设备后退出")
 
-    asyncio.run(run_demo(args.host, args.port, args.call_id))
+    parser.add_argument("--chunk-ms", type=int, default=DEFAULT_CHUNK_MS)
+    parser.add_argument("--realtime", action="store_true", default=True)
+    parser.add_argument("--no-realtime", dest="realtime", action="store_false")
+
+    parser.add_argument("--synthetic-seconds", type=float, default=2.0)
+    parser.add_argument("--synthetic-silence-seconds", type=float, default=1.0)
+
+    parser.add_argument("--tail-silence-ms", type=int, default=None, help="尾静音时长；默认文件流=0ms，mic/合成流=1000ms")
+    parser.add_argument("--wait-after-send-ms", type=int, default=None, help="发送后额外等待；默认文件流=0ms，mic/合成流=1000ms")
+
+    parser.add_argument("--log-level", default="DEBUG", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    setup_logging(args.log_level)
+    asyncio.run(run(args))
 
 
 if __name__ == "__main__":
