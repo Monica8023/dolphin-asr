@@ -211,16 +211,18 @@ class StreamHandler:
         logger.info("call_id=%s intent_id=%s text=%r epoch=%s", self.call_id, intent_id, sentence, sentence_epoch)
 
         if intent_id != "intent_unknown":
-            await self._send_callback(intent_id)
+            await self._send_callback(intent_id, sentence)
 
     # ------------------------------------------------------------------ #
     #  对外推送                                                             #
     # ------------------------------------------------------------------ #
 
-    async def _send_callback(self, intent_id: str) -> None:
+    async def _send_callback(self, intent_id: str, text: str) -> None:
         payload = {
             "call_id": self.call_id,
+            "event": "intent",
             "intent_id": intent_id,
+            "text": text,
             "uuid": self.uuid,
         }
         await self._post(cfg.get("business_callback_url"), payload, "intent callback")

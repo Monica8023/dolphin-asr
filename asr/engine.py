@@ -27,6 +27,7 @@ class ASREngine:
 
     def __init__(self) -> None:
         self._cache: dict = {}
+        self._audio_buffer = np.zeros(0, dtype=np.float32)
 
     def transcribe(self, audio_bytes: bytes, is_final: bool = False) -> str:
         """
@@ -47,24 +48,55 @@ class ASREngine:
             if audio_bytes
             else np.zeros(0, dtype=np.float32)
         )
+        if audio_np.size:
+            self._audio_buffer = np.concatenate((self._audio_buffer, audio_np))
 
         chunk_size = cfg.get("asr_chunk_size", [0, 10, 5])
         encoder_look_back = cfg.get("asr_encoder_chunk_look_back", 4)
         decoder_look_back = cfg.get("asr_decoder_chunk_look_back", 1)
 
-        result = _model.generate(
-            input=audio_np,
-            cache=self._cache,
-            is_final=is_final,
-            chunk_size=chunk_size,
-            encoder_chunk_look_back=encoder_look_back,
-            decoder_chunk_look_back=decoder_look_back,
-            disable_pbar=True,
-        )
-        if result and result[0].get("text"):
-            return result[0]["text"].strip()
-        return ""
+        current_chunk = chunk_size[1] if isinstance(chunk_size, (list, tuple)) and len(chunk_size) > 1 else 10
+        chunk_stride = max(1, int(current_chunk)) * 960
+
+        texts: list[str] = []
+
+        while self._audio_buffer.size >= chunk_stride:
+            chunk = self._audio_buffer[:chunk_stride]
+            self._audio_buffer = self._audio_buffer[chunk_stride:]
+            result = _model.generate(
+                input=chunk,
+                cache=self._cache,
+                is_final=False,
+                chunk_size=chunk_size,
+                encoder_chunk_look_back=encoder_look_back,
+                decoder_chunk_look_back=decoder_look_back,
+                disable_pbar=True,
+            )
+            if result and result[0].get("text"):
+                text = result[0]["text"].strip()
+                if text:
+                    texts.append(text)
+
+        if is_final:
+            final_chunk = self._audio_buffer
+            self._audio_buffer = np.zeros(0, dtype=np.float32)
+            result = _model.generate(
+                input=final_chunk,
+                cache=self._cache,
+                is_final=True,
+                chunk_size=chunk_size,
+                encoder_chunk_look_back=encoder_look_back,
+                decoder_chunk_look_back=decoder_look_back,
+                disable_pbar=True,
+            )
+            if result and result[0].get("text"):
+                text = result[0]["text"].strip()
+                if text:
+                    texts.append(text)
+
+        return "".join(texts)
 
     def reset(self) -> None:
         """重置流式状态（通话结束或重新开始时调用）。"""
         self._cache = {}
+        self._audio_buffer = np.zeros(0, dtype=np.float32)
