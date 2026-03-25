@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from asr.engine import ASREngine
+from asr.offline_engine import OfflineASREngine  # [新增] 导入离线引擎
 from asr.vad import VADDetector
 from config import nacos_config as cfg
 
@@ -35,16 +36,19 @@ class StreamHandler:
         self._executor = executor
         self._vad = VADDetector(threshold_ms=cfg.get("vad_interrupt_threshold_ms", 2000))
         self._asr = ASREngine()
-        self._paused = False
+        self._offline_asr = OfflineASREngine()  # [新增] 实例化离线引擎
+        self._paused = True
 
-        # 当前句子文本缓冲
+        # 当前句子文本缓冲与音频缓冲
         self._sentence_parts: list[str] = []
+        self._sentence_audio_buffer = bytearray()  # [新增] 缓冲当前整句的音频
         self._sentence_start_ms: int = 0
         self._sentence_epoch: int = 0
 
         # 全量转写片段
         self._all_segments: list[dict[str, Any]] = []
         self._elapsed_ms: int = 0
+        self._total_samples: int = 0
 
         # 停顿检测状态
         self._in_speech: bool = False
@@ -64,12 +68,30 @@ class StreamHandler:
         """连接断开或流程结束时调用。"""
         if self._no_answer_task:
             self._no_answer_task.cancel()
+            self._no_answer_task = None
         if self._match_timeout_task:
             self._match_timeout_task.cancel()
+            self._match_timeout_task = None
+
+    def pause(self) -> None:
+        """由 pause/stop 事件调用：暂停识别并重置状态。"""
+        self.stop_timers()
+        self._paused = True
+        self._no_answer_sent = False
+        self._reset_sentence_state()
+
+    def resume(self) -> None:
+        """由 start 事件调用：重置状态并重新启动计时器。"""
+        self.stop_timers()
+        self._paused = False
+        self._no_answer_sent = False
+        self._reset_sentence_state()
+        self.start_timers()
 
     def _reset_sentence_state(self) -> None:
         """每句话处理完毕后调用，重置句子级状态，允许持续识别下一句。"""
         self._sentence_parts = []
+        self._sentence_audio_buffer.clear()  # [新增] 清空音频缓冲
         self._in_speech = False
         self._last_speech_end_ms = None
         self._first_text_received = False
@@ -85,22 +107,46 @@ class StreamHandler:
         if self._paused:
             return
         loop = asyncio.get_running_loop()
+
+        # [修改] 获取流式模型最后的 flush
         text = await loop.run_in_executor(self._executor, self._asr.transcribe, b"", True)
         if text:
             self._sentence_parts.append(text)
-        if self._sentence_parts:
-            sentence = "".join(self._sentence_parts)
+
+        final_sentence = ""
+
+        # [新增] 如果缓冲区有残留音频，尝试用离线模型做最后一次高精度识别
+        if self._sentence_audio_buffer:
+            final_audio = bytes(self._sentence_audio_buffer)
+            offline_text = await loop.run_in_executor(self._executor, self._offline_asr.transcribe, final_audio)
+            if offline_text:
+                final_sentence = offline_text
+
+        # 降级：如果离线没结果，用在线模型拼凑的文本
+        if not final_sentence and self._sentence_parts:
+            final_sentence = "".join(self._sentence_parts)
+
+        if final_sentence:
             self._sentence_parts = []
-            logger.info("call_id=%s final flush: %s", self.call_id, sentence)
-            await self._call_intent(sentence)
+            logger.info("call_id=%s final flush: %s", self.call_id, final_sentence)
+            await self._call_intent(final_sentence)
 
     async def handle_audio(self, audio_bytes: bytes) -> None:
         if self._paused:
             logger.debug("call_id=%s handle_audio skipped: paused", self.call_id)
             return
 
-        chunk_ms = self._estimate_duration_ms(audio_bytes)
-        end_ms = self._elapsed_ms + chunk_ms
+        bytes_per_sample = 2  # 16-bit
+        num_samples = len(audio_bytes) // bytes_per_sample
+        self._total_samples += num_samples
+
+        # chunk_ms = self._estimate_duration_ms(audio_bytes)
+        # end_ms = self._elapsed_ms + chunk_ms
+
+        end_ms = int(self._total_samples / 16000 * 1000)
+
+        # 如果有些地方依然需要 chunk_ms
+        chunk_ms = end_ms - self._elapsed_ms
         logger.debug(
             "call_id=%s handle_audio start: bytes=%d chunk_ms=%d elapsed_ms=%d end_ms=%d",
             self.call_id,
@@ -109,6 +155,9 @@ class StreamHandler:
             self._elapsed_ms,
             end_ms,
         )
+
+        # [新增] 缓冲当前音频帧，供离线模型使用
+        self._sentence_audio_buffer.extend(audio_bytes)
 
         loop = asyncio.get_running_loop()
 
@@ -120,7 +169,8 @@ class StreamHandler:
         if cfg.get("interrupt_enabled", True):
             logger.debug("call_id=%s step1.5 interrupt check start", self.call_id)
             should_interrupt = await loop.run_in_executor(self._executor, self._vad.process_speech, is_speech)
-            logger.debug("call_id=%s step1.5 interrupt check result: should_interrupt=%s", self.call_id, should_interrupt)
+            logger.debug("call_id=%s step1.5 interrupt check result: should_interrupt=%s", self.call_id,
+                         should_interrupt)
             if should_interrupt:
                 logger.info("call_id=%s step1.5 interrupt triggered", self.call_id)
                 asyncio.create_task(self._send_interrupt())
@@ -167,7 +217,17 @@ class StreamHandler:
                     bool(self._sentence_parts),
                 )
                 if silence_ms >= cfg.get("silence_max_ms", 800) and self._sentence_parts:
-                    sentence = "".join(self._sentence_parts)
+                    # [修改] 提取原始流式识别的句子，并同时提取音频送入离线模型纠错
+                    online_sentence = "".join(self._sentence_parts)
+                    sentence_audio = bytes(self._sentence_audio_buffer)
+
+                    logger.debug("call_id=%s step3 running offline ASR for accuracy...", self.call_id)
+                    offline_sentence = await loop.run_in_executor(self._executor, self._offline_asr.transcribe,
+                                                                  sentence_audio)
+
+                    # 如果离线模型吐出了有效文本，则覆盖；否则降级保留原本的在线结果
+                    sentence = offline_sentence if offline_sentence else online_sentence
+
                     self._sentence_parts = []
                     self._sentence_start_ms = end_ms
                     self._in_speech = False
@@ -175,7 +235,10 @@ class StreamHandler:
                     self._sentence_epoch += 1
                     sentence_epoch = self._sentence_epoch
                     self._reset_sentence_state()
-                    logger.info("call_id=%s step3 sentence done (silence %dms): %s", self.call_id, silence_ms, sentence)
+
+                    # [修改] 在原本的日志中额外增加 Online 和 Offline 的对比，方便 Debug 精度提升效果
+                    logger.info("call_id=%s step3 sentence done (silence %dms): %s (Online raw: %s)",
+                                self.call_id, silence_ms, sentence, online_sentence)
                     logger.info("call_id=%s step3 intent task scheduled (epoch=%d)", self.call_id, sentence_epoch)
                     asyncio.create_task(self._call_intent(sentence, sentence_epoch))
 
@@ -198,7 +261,8 @@ class StreamHandler:
             logger.warning("call_id=%s intent call failed: %s", self.call_id, e)
             return
 
-        if cfg.get("intent_epoch_guard_enabled", True) and sentence_epoch is not None and sentence_epoch != self._sentence_epoch:
+        if cfg.get("intent_epoch_guard_enabled",
+                   True) and sentence_epoch is not None and sentence_epoch != self._sentence_epoch:
             logger.info(
                 "call_id=%s intent result ignored: stale epoch result=%s current=%s",
                 self.call_id,
@@ -222,24 +286,31 @@ class StreamHandler:
             "call_id": self.call_id,
             "event": "intent",
             "intent_id": intent_id,
-            "text": text,
             "uuid": self.uuid,
         }
         await self._post(cfg.get("business_callback_url"), payload, "intent callback")
 
     async def _send_interrupt(self) -> None:
-        await self._post(cfg.get("interrupt_url"), {"call_id": self.call_id}, "interrupt", timeout=3.0)
+        payload = {
+            "call_id": self.call_id,
+            "event": "interrupt",
+            "uuid": self.uuid,
+        }
+        await self._post(cfg.get("business_callback_url"), payload, "interrupt", timeout=3.0)
 
     async def _send_no_answer(self) -> None:
-        payload = {"call_id": self.call_id, "event": "no_answer", "timestamp": int(time.time() * 1000)}
+        payload = {
+            "call_id": self.call_id,
+            "event": "no_answer",
+            "uuid": self.uuid,
+        }
         await self._post(cfg.get("business_callback_url"), payload, "no_answer", timeout=3.0)
 
     async def _send_fallback(self) -> None:
         payload = {
             "call_id": self.call_id,
             "event": "match_timeout",
-            "transcript": "".join(s["text"] for s in self._all_segments),
-            "timestamp": int(time.time() * 1000),
+            "uuid": self.uuid,
         }
         await self._post(cfg.get("business_callback_url"), payload, "match_timeout fallback", timeout=3.0)
 

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,7 @@ from config import nacos_config as cfg
 from log_config import setup_logging
 from asr.engine import load_model
 from asr.vad import load_vad_model
+from asr.offline_engine import load_offline_model
 from asr.stream_handler import StreamHandler
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,7 @@ async def lifespan(app: FastAPI):
     )
     load_model()
     load_vad_model()
+    load_offline_model()
 
     # P0-fix-3: 全局 httpx 连接池，所有 StreamHandler 共用
     app.state.http_client = httpx.AsyncClient(
@@ -86,6 +89,35 @@ async def test_intent(req: IntentTestRequest) -> dict[str, Any]:
     return {"request": payload, "response": data}
 
 
+async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: str, call_id: int) -> bool:
+    """处理文本事件帧，返回是否需要结束 ws 循环。"""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.warning("call_id=%s invalid event frame: %r", call_id, raw)
+        return False
+
+    event = data.get("event")
+    if event == "start":
+        logger.info("call_id=%s event=start: ASR resumed", call_id)
+        handler.resume()
+        return False
+
+    if event == "pause":
+        logger.info("call_id=%s event=pause: ASR paused", call_id)
+        handler.pause()
+        return False
+
+    if event == "stop":
+        logger.info("call_id=%s event=stop: closing websocket", call_id)
+        handler.pause()
+        await websocket.close()
+        return True
+
+    logger.warning("call_id=%s unknown event=%r", call_id, event)
+    return False
+
+
 @app.websocket("/ws/asr")
 async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0):
     await websocket.accept()
@@ -95,12 +127,24 @@ async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0):
         http_client=websocket.app.state.http_client,
         executor=websocket.app.state.executor,
     )
-    handler.start_timers()
     logger.info("WebSocket connected: call_id=%s", call_id)
     try:
         while True:
-            audio_bytes = await websocket.receive_bytes()
-            await handler.handle_audio(audio_bytes)
+            message = await websocket.receive()
+
+            if message.get("type") == "websocket.disconnect":
+                break
+
+            text = message.get("text")
+            if text is not None:
+                should_close = await _handle_ws_event(websocket, handler, text, call_id)
+                if should_close:
+                    break
+                continue
+
+            audio_bytes = message.get("bytes")
+            if audio_bytes is not None:
+                await handler.handle_audio(audio_bytes)
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected: call_id=%s", call_id)
     except Exception as e:
