@@ -29,12 +29,23 @@ class StreamHandler:
     - executor: 外部注入的 ThreadPoolExecutor，将 CPU 密集推理移出事件循环
     """
 
-    def __init__(self, call_id: int, uuid: int, http_client: httpx.AsyncClient, executor: Executor):
+    def __init__(self, call_id: int, uuid: int, model_id: int, http_client: httpx.AsyncClient, executor: Executor):
         self.call_id = call_id
         self.uuid = uuid
+        self.model_id = model_id
         self._http_client = http_client
         self._executor = executor
-        self._vad = VADDetector(threshold_ms=cfg.get("vad_interrupt_threshold_ms", 2000))
+
+        # 初始化时先用全局配置，start 事件后由 load_conf() 覆盖
+        self._silence_max_ms: int = cfg.get("silence_max_ms", 800)
+        self._no_answer_timeout_ms: int = cfg.get("no_answer_timeout_ms", 10000)
+        self._match_timeout_ms: int = 10000
+        self._interrupt_enabled: bool = cfg.get("interrupt_enabled", True)
+        self._interrupt_threshold_ms: int = cfg.get("vad_interrupt_threshold_ms", 2000)
+        self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
+        self._word_count: int | None = None
+
+        self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         self._asr = ASREngine()
         self._offline_asr = OfflineASREngine()  # [新增] 实例化离线引擎
         self._paused = True
@@ -59,6 +70,9 @@ class StreamHandler:
         self._match_timeout_task: asyncio.Task | None = None
         self._first_text_received: bool = False
         self._no_answer_sent: bool = False
+
+        # 打断前置禁区：resume() 时记录起始时刻
+        self._interrupt_allow_after: float = 0.0
 
     def start_timers(self) -> None:
         """连接建立后调用，启动无应答计时器。"""
@@ -86,7 +100,36 @@ class StreamHandler:
         self._paused = False
         self._no_answer_sent = False
         self._reset_sentence_state()
+        # 记录打断禁区截止时刻
+        self._interrupt_allow_after = time.monotonic() + self._interrupt_ignore_start_ms / 1000
         self.start_timers()
+
+    def load_conf(self, call_conf: dict) -> None:
+        """由 start 事件触发，从 Redis conf 覆盖计时参数；call_conf 为空则保持全局默认值。"""
+        if not call_conf:
+            logger.info("call_id=%s model_id=%s no redis conf, using global defaults", self.call_id, self.model_id)
+            return
+
+        interrupt_cfg = call_conf.get("interruptConfig") or {}
+        intervene_cfg = call_conf.get("interveneConfig") or {}
+
+        self._silence_max_ms = call_conf.get("maxPauseTime") or self._silence_max_ms
+        self._no_answer_timeout_ms = call_conf.get("noResponseTime") or self._no_answer_timeout_ms
+        if "enable" in interrupt_cfg:
+            self._interrupt_enabled = interrupt_cfg["enable"]
+        self._interrupt_threshold_ms = interrupt_cfg.get("interruptTime") or self._interrupt_threshold_ms
+        self._interrupt_ignore_start_ms = (interrupt_cfg.get("startIgnoreSeconds") or 0) * 1000
+        if intervene_cfg.get("enable"):
+            self._word_count = intervene_cfg.get("wordCount")
+
+        self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
+        logger.info(
+            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms word_count=%s",
+            self.call_id, self.model_id,
+            self._silence_max_ms, self._no_answer_timeout_ms,
+            self._interrupt_enabled, self._interrupt_threshold_ms,
+            self._interrupt_ignore_start_ms, self._word_count,
+        )
 
     def _reset_sentence_state(self) -> None:
         """每句话处理完毕后调用，重置句子级状态，允许持续识别下一句。"""
@@ -166,14 +209,20 @@ class StreamHandler:
         logger.debug("call_id=%s step1 is_speech=%s", self.call_id, is_speech)
 
         # 1.5 打断检测（基于 step1 的 is_speech，不重复跑 VAD）
-        if cfg.get("interrupt_enabled", True):
-            logger.debug("call_id=%s step1.5 interrupt check start", self.call_id)
-            should_interrupt = await loop.run_in_executor(self._executor, self._vad.process_speech, is_speech)
-            logger.debug("call_id=%s step1.5 interrupt check result: should_interrupt=%s", self.call_id,
-                         should_interrupt)
-            if should_interrupt:
-                logger.info("call_id=%s step1.5 interrupt triggered", self.call_id)
-                asyncio.create_task(self._send_interrupt())
+        if self._interrupt_enabled:
+            in_ignore_window = time.monotonic() < self._interrupt_allow_after
+            if in_ignore_window:
+                logger.debug("call_id=%s step1.5 interrupt check skipped: in ignore window", self.call_id)
+                # 仍需驱动 process_speech 以维护 VAD 内部状态，但不触发打断
+                await loop.run_in_executor(self._executor, self._vad.process_speech, is_speech)
+            else:
+                logger.debug("call_id=%s step1.5 interrupt check start", self.call_id)
+                should_interrupt = await loop.run_in_executor(self._executor, self._vad.process_speech, is_speech)
+                logger.debug("call_id=%s step1.5 interrupt check result: should_interrupt=%s", self.call_id,
+                             should_interrupt)
+                if should_interrupt:
+                    logger.info("call_id=%s step1.5 interrupt triggered", self.call_id)
+                    asyncio.create_task(self._send_interrupt())
         else:
             logger.debug("call_id=%s step1.5 interrupt check skipped: interrupt_enabled=false", self.call_id)
 
@@ -213,10 +262,10 @@ class StreamHandler:
                     "call_id=%s step3 silence check: silence_ms=%d threshold_ms=%d has_sentence_parts=%s",
                     self.call_id,
                     silence_ms,
-                    cfg.get("silence_max_ms", 800),
+                    self._silence_max_ms,
                     bool(self._sentence_parts),
                 )
-                if silence_ms >= cfg.get("silence_max_ms", 800) and self._sentence_parts:
+                if silence_ms >= self._silence_max_ms and self._sentence_parts:
                     # [修改] 提取原始流式识别的句子，并同时提取音频送入离线模型纠错
                     online_sentence = "".join(self._sentence_parts)
                     sentence_audio = bytes(self._sentence_audio_buffer)
@@ -251,7 +300,13 @@ class StreamHandler:
 
     async def _call_intent(self, sentence: str, sentence_epoch: int | None = None) -> None:
         url = f"{cfg.get('intent_service_url')}/api/v1/recognize"
-        payload = {"text": sentence, "call_id": str(self.call_id)}
+        payload: dict = {
+            "text": sentence,
+            "call_id": str(self.call_id),
+            "model_id": self.model_id,
+        }
+        if self._word_count is not None:
+            payload["word_count"] = self._word_count
         logger.debug("call_id=%s step3 intent payload=%s epoch=%s", self.call_id, payload, sentence_epoch)
         try:
             resp = await self._http_client.post(url, json=payload)
@@ -329,7 +384,7 @@ class StreamHandler:
     # ------------------------------------------------------------------ #
 
     async def _no_answer_timer(self) -> None:
-        timeout_s = cfg.get("no_answer_timeout_ms", 10000) / 1000
+        timeout_s = self._no_answer_timeout_ms / 1000
         await asyncio.sleep(timeout_s)
         if not self._paused and not self._no_answer_sent:
             logger.info("call_id=%s no_answer timeout (%.1fs)", self.call_id, timeout_s)
@@ -338,7 +393,7 @@ class StreamHandler:
             self._reset_sentence_state()
 
     async def _match_timer(self) -> None:
-        timeout_s = cfg.get("match_timeout_ms", 15000) / 1000
+        timeout_s = self._match_timeout_ms / 1000
         await asyncio.sleep(timeout_s)
         if not self._paused:
             logger.info("call_id=%s match timeout (%.1fs)", self.call_id, timeout_s)
