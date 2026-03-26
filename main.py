@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
@@ -47,10 +48,19 @@ async def lifespan(app: FastAPI):
     )
     app.state.executor = _executor
 
+    # Redis 客户端（per-call 配置从 Redis 拉取）
+    app.state.redis = aioredis.from_url(
+        f"redis://{os.environ.get('REDIS_HOST', '127.0.0.1')}:{os.environ.get('REDIS_PORT', '6379')}",
+        password=os.environ.get("REDIS_PASSWORD") or None,
+        db=int(os.environ.get("REDIS_DB", "0")),
+        decode_responses=True,
+    )
+
     logger.info("dolphin-asr service started.")
     yield
 
     await app.state.http_client.aclose()
+    await app.state.redis.aclose()
     _executor.shutdown(wait=False)
     logger.info("dolphin-asr service stopped.")
 
@@ -89,6 +99,19 @@ async def test_intent(req: IntentTestRequest) -> dict[str, Any]:
     return {"request": payload, "response": data}
 
 
+async def _load_model_conf(redis_client: aioredis.Redis, model_id: int) -> dict:
+    """从 Redis 拉取 ai_model:{model_id}:conf；key 不存在或异常时返回空 dict。"""
+    key = f"ai_model:{model_id}:conf"
+    try:
+        raw = await redis_client.get(key)
+        if raw:
+            return json.loads(raw)
+        logger.info("model_id=%s redis key not found: %s, using global defaults", model_id, key)
+    except Exception as e:
+        logger.warning("model_id=%s redis get conf failed: %s, using global defaults", model_id, e)
+    return {}
+
+
 async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: str, call_id: int) -> bool:
     """处理文本事件帧，返回是否需要结束 ws 循环。"""
     try:
@@ -100,6 +123,8 @@ async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: st
     event = data.get("event")
     if event == "start":
         logger.info("call_id=%s event=start: ASR resumed", call_id)
+        call_conf = await _load_model_conf(websocket.app.state.redis, handler.model_id)
+        handler.load_conf(call_conf)
         handler.resume()
         return False
 
@@ -119,11 +144,12 @@ async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: st
 
 
 @app.websocket("/ws/asr")
-async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0):
+async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0, model_id: int = 0):
     await websocket.accept()
     handler = StreamHandler(
         call_id=call_id,
         uuid=uuid,
+        model_id=model_id,
         http_client=websocket.app.state.http_client,
         executor=websocket.app.state.executor,
     )
