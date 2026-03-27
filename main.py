@@ -50,9 +50,9 @@ async def lifespan(app: FastAPI):
 
     # Redis 客户端（per-call 配置从 Redis 拉取）
     app.state.redis = aioredis.from_url(
-        f"redis://{os.environ.get('REDIS_HOST', '127.0.0.1')}:{os.environ.get('REDIS_PORT', '6379')}",
+        f"redis://{os.environ.get('REDIS_HOST', 'dev.redis.service.com')}:{os.environ.get('REDIS_PORT', '6379')}",
         password=os.environ.get("REDIS_PASSWORD") or None,
-        db=int(os.environ.get("REDIS_DB", "0")),
+        db=int(os.environ.get("REDIS_DB", "9")),
         decode_responses=True,
     )
 
@@ -114,10 +114,23 @@ async def _load_model_conf(redis_client: aioredis.Redis, model_id: int) -> dict:
 
 async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: str, call_id: int) -> bool:
     """处理文本事件帧，返回是否需要结束 ws 循环。"""
+    preview = raw if len(raw) <= 200 else f"{raw[:200]}..."
+    logger.info(
+        "call_id=%s ws text frame received: raw_len=%d preview=%r",
+        call_id,
+        len(raw),
+        preview,
+    )
     try:
         data = json.loads(raw)
-    except ValueError:
-        logger.warning("call_id=%s invalid event frame: %r", call_id, raw)
+    except ValueError as e:
+        logger.warning(
+            "call_id=%s invalid event frame: raw_len=%d preview=%r err=%s",
+            call_id,
+            len(raw),
+            preview,
+            e,
+        )
         return False
 
     event = data.get("event")
@@ -157,20 +170,39 @@ async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0, model_id: in
     try:
         while True:
             message = await websocket.receive()
+            msg_type = message.get("type")
+            text = message.get("text")
+            audio_bytes = message.get("bytes")
+            unknown_keys = sorted(k for k in message.keys() if k not in {"type", "text", "bytes"})
 
-            if message.get("type") == "websocket.disconnect":
+            # logger.info(
+            #     "call_id=%s ws message: type=%s text_none=%s text_len=%d bytes_none=%s bytes_len=%d extra_keys=%s",
+            #     call_id,
+            #     msg_type,
+            #     text is None,
+            #     len(text) if text is not None else 0,
+            #     audio_bytes is None,
+            #     len(audio_bytes) if audio_bytes is not None else 0,
+            #     unknown_keys,
+            # )
+
+            if msg_type == "websocket.disconnect":
+                logger.info("WebSocket message indicates disconnect: call_id=%s", call_id)
                 break
 
-            text = message.get("text")
             if text is not None:
+                # logger.info("call_id=%s routing ws text frame to event handler", call_id)
                 should_close = await _handle_ws_event(websocket, handler, text, call_id)
                 if should_close:
                     break
                 continue
 
-            audio_bytes = message.get("bytes")
             if audio_bytes is not None:
+                # logger.info("call_id=%s routing ws binary frame to audio handler: bytes=%d", call_id, len(audio_bytes))
                 await handler.handle_audio(audio_bytes)
+                continue
+
+            logger.warning("call_id=%s ws message ignored: neither text nor bytes present", call_id)
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected: call_id=%s", call_id)
     except Exception as e:

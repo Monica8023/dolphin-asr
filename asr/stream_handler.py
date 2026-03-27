@@ -43,7 +43,7 @@ class StreamHandler:
         self._interrupt_enabled: bool = cfg.get("interrupt_enabled", True)
         self._interrupt_threshold_ms: int = cfg.get("vad_interrupt_threshold_ms", 2000)
         self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
-        self._word_count: int | None = None
+        self._word_count: int = 2
 
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         self._asr = ASREngine()
@@ -119,12 +119,44 @@ class StreamHandler:
             self._interrupt_enabled = interrupt_cfg["enable"]
         self._interrupt_threshold_ms = interrupt_cfg.get("interruptTime") or self._interrupt_threshold_ms
         self._interrupt_ignore_start_ms = (interrupt_cfg.get("startIgnoreSeconds") or 0) * 1000
-        if intervene_cfg.get("enable"):
-            self._word_count = intervene_cfg.get("wordCount")
+
+        type_threshold = intervene_cfg.get("typeThreshold")
+        if type_threshold is None:
+            type_threshold = intervene_cfg.get("wordCount")
+
+        normalized_threshold: int | None = None
+        if type_threshold is not None:
+            try:
+                parsed = int(type_threshold)
+                if parsed >= 1:
+                    normalized_threshold = parsed
+                else:
+                    logger.warning(
+                        "call_id=%s model_id=%s invalid type_threshold=%r (<1), keep previous=%s",
+                        self.call_id,
+                        self.model_id,
+                        type_threshold,
+                        self._word_count,
+                    )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "call_id=%s model_id=%s invalid type_threshold=%r (non-int), keep previous=%s",
+                    self.call_id,
+                    self.model_id,
+                    type_threshold,
+                    self._word_count,
+                )
+
+        if "enable" in intervene_cfg:
+            if intervene_cfg.get("enable"):
+                if normalized_threshold is not None:
+                    self._word_count = normalized_threshold
+            else:
+                self._word_count = None
 
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         logger.info(
-            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms word_count=%s",
+            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms type_threshold=%s",
             self.call_id, self.model_id,
             self._silence_max_ms, self._no_answer_timeout_ms,
             self._interrupt_enabled, self._interrupt_threshold_ms,
@@ -245,6 +277,7 @@ class StreamHandler:
             })
             text_preview = text if len(text) <= 120 else f"{text[:120]}..."
             logger.info("call_id=%s step2 asr text=%r", self.call_id, text_preview)
+
         else:
             logger.debug("call_id=%s step2 asr empty text", self.call_id)
 
@@ -289,6 +322,7 @@ class StreamHandler:
                     logger.info("call_id=%s step3 sentence done (silence %dms): %s (Online raw: %s)",
                                 self.call_id, silence_ms, sentence, online_sentence)
                     logger.info("call_id=%s step3 intent task scheduled (epoch=%d)", self.call_id, sentence_epoch)
+                    asyncio.create_task(self._send_transcript(sentence))
                     asyncio.create_task(self._call_intent(sentence, sentence_epoch))
 
         self._elapsed_ms = end_ms
@@ -306,7 +340,7 @@ class StreamHandler:
             "model_id": self.model_id,
         }
         if self._word_count is not None:
-            payload["word_count"] = self._word_count
+            payload["type_threshold"] = self._word_count
         logger.debug("call_id=%s step3 intent payload=%s epoch=%s", self.call_id, payload, sentence_epoch)
         try:
             resp = await self._http_client.post(url, json=payload)
@@ -342,8 +376,19 @@ class StreamHandler:
             "event": "intent",
             "intent_id": intent_id,
             "uuid": self.uuid,
+            "text": text,
         }
         await self._post(cfg.get("business_callback_url"), payload, "intent callback")
+
+    async def _send_transcript(self, text: str) -> None:
+        payload = {
+            "call_id": self.call_id,
+            "event": "transcript",
+            "uuid": self.uuid,
+            "text": text,
+        }
+        await self._post(cfg.get("transcript_url"), payload, "transcript", timeout=3.0)
+        logger.info(f"call_id={self.call_id} transcript={text} 发送文本识别消息={cfg.get("transcript_url")}")
 
     async def _send_interrupt(self) -> None:
         payload = {

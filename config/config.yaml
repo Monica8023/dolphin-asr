@@ -1,6 +1,7 @@
 intent_service_url: "http://127.0.0.1:8808"
-business_callback_url: "http://127.0.0.1:19000/callback"
-interrupt_url: "http://127.0.0.1:19000/interrupt"
+business_callback_url: "http://127.0.0.1:9000/callback"
+interrupt_url: "http://127.0.0.1:9000/interrupt"
+transcript_url: "http://127.0.0.1:9000/transcript"
 
 # VAD 打断：检测到连续说话超过此时长触发无意图打断
 vad_interrupt_threshold_ms: 2000
@@ -22,6 +23,7 @@ log_level: "INFO"
 # FunASR 模型配置（路径通过此处配置，支持 Nacos 热更新）
 asr_model_path: "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
 vad_model_path: "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+offline_asr_model_path: "D:/model/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
 asr_device: "cpu"
 # 流式推理分块参数：[lookback, current, lookahead]（单位：LFR 帧，1帧≈60ms）
 asr_chunk_size: [0, 6, 2]
