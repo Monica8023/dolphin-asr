@@ -43,7 +43,10 @@ class StreamHandler:
         self._interrupt_enabled: bool = cfg.get("interrupt_enabled", True)
         self._interrupt_threshold_ms: int = cfg.get("vad_interrupt_threshold_ms", 2000)
         self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
-        self._word_count: int = 2
+        self._word_count: int | None = 2
+        self._question_similarity: float | None = None
+        self._asr_hangover_ms: int = cfg.get("asr_noise_hangover_ms", 240)
+        self._asr_max_skip_ms: int = cfg.get("asr_max_skip_ms", 600)
 
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         self._asr = ASREngine()
@@ -60,6 +63,8 @@ class StreamHandler:
         self._all_segments: list[dict[str, Any]] = []
         self._elapsed_ms: int = 0
         self._total_samples: int = 0
+        self._last_speech_ms: int | None = None
+        self._last_asr_feed_ms: int | None = None
 
         # 停顿检测状态
         self._in_speech: bool = False
@@ -120,9 +125,7 @@ class StreamHandler:
         self._interrupt_threshold_ms = interrupt_cfg.get("interruptTime") or self._interrupt_threshold_ms
         self._interrupt_ignore_start_ms = (interrupt_cfg.get("startIgnoreSeconds") or 0) * 1000
 
-        type_threshold = intervene_cfg.get("typeThreshold")
-        if type_threshold is None:
-            type_threshold = intervene_cfg.get("wordCount")
+        type_threshold = intervene_cfg.get("wordCount")
 
         normalized_threshold: int | None = None
         if type_threshold is not None:
@@ -132,7 +135,7 @@ class StreamHandler:
                     normalized_threshold = parsed
                 else:
                     logger.warning(
-                        "call_id=%s model_id=%s invalid type_threshold=%r (<1), keep previous=%s",
+                        "call_id=%s model_id=%s invalid wordCount=%r (<1), keep previous=%s",
                         self.call_id,
                         self.model_id,
                         type_threshold,
@@ -140,7 +143,7 @@ class StreamHandler:
                     )
             except (TypeError, ValueError):
                 logger.warning(
-                    "call_id=%s model_id=%s invalid type_threshold=%r (non-int), keep previous=%s",
+                    "call_id=%s model_id=%s invalid wordCount=%r (non-int), keep previous=%s",
                     self.call_id,
                     self.model_id,
                     type_threshold,
@@ -154,13 +157,39 @@ class StreamHandler:
             else:
                 self._word_count = None
 
+        question_similarity = call_conf.get("questionSimilarity")
+        if question_similarity is None:
+            question_similarity = intervene_cfg.get("questionSimilarity")
+        normalized_similarity: float | None = None
+        if question_similarity is not None:
+            try:
+                parsed_similarity = float(question_similarity)
+                if parsed_similarity < 0:
+                    logger.warning(
+                        "call_id=%s model_id=%s invalid question_similarity=%r (<0), ignore",
+                        self.call_id,
+                        self.model_id,
+                        question_similarity,
+                    )
+                else:
+                    normalized_similarity = parsed_similarity
+            except (TypeError, ValueError):
+                logger.warning(
+                    "call_id=%s model_id=%s invalid question_similarity=%r (non-float), ignore",
+                    self.call_id,
+                    self.model_id,
+                    question_similarity,
+                )
+
+        self._question_similarity = normalized_similarity
+
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         logger.info(
-            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms type_threshold=%s",
+            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms type_threshold=%s question_similarity=%s",
             self.call_id, self.model_id,
             self._silence_max_ms, self._no_answer_timeout_ms,
             self._interrupt_enabled, self._interrupt_threshold_ms,
-            self._interrupt_ignore_start_ms, self._word_count,
+            self._interrupt_ignore_start_ms, self._word_count, self._question_similarity,
         )
 
     def _reset_sentence_state(self) -> None:
@@ -175,6 +204,8 @@ class StreamHandler:
             self._match_timeout_task = None
         self._asr.reset()
         self._vad.reset()
+        self._last_speech_ms = None
+        self._last_asr_feed_ms = None
 
     async def close(self) -> None:
         """连接断开时调用：刷新模型内部缓冲区，处理最后一帧剩余文本。"""
@@ -340,7 +371,9 @@ class StreamHandler:
             "model_id": self.model_id,
         }
         if self._word_count is not None:
-            payload["type_threshold"] = self._word_count
+            payload["word_count"] = self._word_count
+        if self._question_similarity is not None:
+            payload["question_similarity"] = self._question_similarity
         logger.debug("call_id=%s step3 intent payload=%s epoch=%s", self.call_id, payload, sentence_epoch)
         try:
             resp = await self._http_client.post(url, json=payload)

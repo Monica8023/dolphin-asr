@@ -29,6 +29,10 @@ DEFAULT_CONFIG = {
     "asr_decoder_chunk_look_back": 0,
     "intent_epoch_guard_enabled": True,
     "asr_workers": 8,
+    "vad_energy_threshold": 500,
+    "asr_noise_hangover_ms": 200,
+    "asr_max_skip_ms": 120,
+    "vad_min_speech_ms": 120,
 }
 
 _config: dict[str, Any] = {}

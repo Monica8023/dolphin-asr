@@ -58,9 +58,11 @@ class VADDetector:
                 logger.warning("FSMN-VAD inference failed, fallback to energy: %s", e)
 
         # 能量阈值降级
+        from config import nacos_config as cfg
+        energy_threshold = cfg.get("vad_energy_threshold", 500)
         samples = struct.unpack_from(f"{len(audio_bytes) // 2}h", audio_bytes)
         rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
-        return rms > 500
+        return rms > energy_threshold
 
     def process_speech(self, speech: bool) -> bool:
         """基于已计算出的 speech 状态更新打断计时，返回是否触发打断。"""
