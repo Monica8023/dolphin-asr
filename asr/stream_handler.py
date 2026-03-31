@@ -121,9 +121,7 @@ class StreamHandler:
         self._interrupt_threshold_ms = interrupt_cfg.get("interruptTime") or self._interrupt_threshold_ms
         self._interrupt_ignore_start_ms = (interrupt_cfg.get("startIgnoreSeconds") or 0) * 1000
 
-        type_threshold = intervene_cfg.get("typeThreshold")
-        if type_threshold is None:
-            type_threshold = intervene_cfg.get("wordCount")
+        type_threshold = intervene_cfg.get("wordCount")
 
         normalized_threshold: int | None = None
         if type_threshold is not None:
@@ -133,7 +131,7 @@ class StreamHandler:
                     normalized_threshold = parsed
                 else:
                     logger.warning(
-                        "call_id=%s model_id=%s invalid type_threshold=%r (<1), keep previous=%s",
+                        "call_id=%s model_id=%s invalid wordCount=%r (<1), keep previous=%s",
                         self.call_id,
                         self.model_id,
                         type_threshold,
@@ -141,7 +139,7 @@ class StreamHandler:
                     )
             except (TypeError, ValueError):
                 logger.warning(
-                    "call_id=%s model_id=%s invalid type_threshold=%r (non-int), keep previous=%s",
+                    "call_id=%s model_id=%s invalid wordCount=%r (non-int), keep previous=%s",
                     self.call_id,
                     self.model_id,
                     type_threshold,
@@ -155,13 +153,40 @@ class StreamHandler:
             else:
                 self._word_count = None
 
+        question_similarity = call_conf.get("questionSimilarity")
+        if question_similarity is None:
+            question_similarity = intervene_cfg.get("questionSimilarity")
+        normalized_similarity: float | None = None
+        if question_similarity is not None:
+            try:
+                parsed_similarity = float(question_similarity)
+                if parsed_similarity < 0:
+                    logger.warning(
+                        "call_id=%s model_id=%s invalid question_similarity=%r (<0), ignore",
+                        self.call_id,
+                        self.model_id,
+                        question_similarity,
+                    )
+                else:
+                    normalized_similarity = parsed_similarity
+            except (TypeError, ValueError):
+                logger.warning(
+                    "call_id=%s model_id=%s invalid question_similarity=%r (non-float), ignore",
+                    self.call_id,
+                    self.model_id,
+                    question_similarity,
+                )
+
+        self._question_similarity = normalized_similarity
+
+
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         logger.info(
-            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms type_threshold=%s",
+            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms type_threshold=%s question_similarity=%s",
             self.call_id, self.model_id,
             self._silence_max_ms, self._no_answer_timeout_ms,
             self._interrupt_enabled, self._interrupt_threshold_ms,
-            self._interrupt_ignore_start_ms, self._word_count,
+            self._interrupt_ignore_start_ms, self._word_count,self._question_similarity
         )
 
     def _reset_sentence_state(self) -> None:
@@ -263,10 +288,7 @@ class StreamHandler:
         # VAD 门控在输出侧：有文字但 VAD 判为非语音时丢弃文字，而非丢弃音频帧
         logger.debug("call_id=%s step2 asr transcribe start (is_speech=%s)", self.call_id, is_speech)
         text = await loop.run_in_executor(self._executor, self._asr.transcribe, audio_bytes)
-        vad_gate_asr = cfg.get("vad_gate_asr", False)
-        if text and vad_gate_asr and not is_speech:
-            logger.info("call_id=%s step2 asr text suppressed by VAD gate: %r", self.call_id, text)
-            text = ""
+
         if text:
             self._reset_no_answer_timer()
             logger.info("call_id=%s step2 no_answer timer reset", self.call_id)
