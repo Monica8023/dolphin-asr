@@ -36,6 +36,48 @@ class VADDetector:
         self._interrupted = False
         self._vad_cache = {}
 
+    def _is_likely_voice_spectrum(self, audio_bytes: bytes) -> bool:
+        """谱校验：频带能量比 + 谱平坦度双维度过滤噪音。"""
+        from config import nacos_config as cfg
+        ratio_threshold = cfg.get("vad_voice_band_ratio", 0.35)
+        if ratio_threshold <= 0:
+            return True  # 阈值为 0 则关闭此功能
+
+        samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+        if len(samples) < 64:
+            return True  # 帧太短，宽松放行
+
+        fft_mag = np.abs(np.fft.rfft(samples))
+        n = len(samples)
+        bin_low = int(300 * n / 16000)
+        bin_high = int(3400 * n / 16000)
+
+        # Gate A：频带能量比（原有逻辑）
+        voice_band = fft_mag[bin_low:bin_high]
+        voice_ratio = np.sum(voice_band) / (np.sum(fft_mag) + 1e-9)
+        if float(voice_ratio) <= ratio_threshold:
+            return False
+
+        # Gate B：谱平坦度（Spectral Flatness）— 只在频带比通过后才计算
+        # 人声共振峰使能量集中，几何均值远小于算术均值 → 平坦度低
+        # 稳态噪音能量均匀分布 → 平坦度接近 1.0
+        # 只对人声频带内计算，排除带外干扰
+        flatness_threshold = cfg.get("vad_spectral_flatness_max", 0.6)
+        if flatness_threshold > 0 and len(voice_band) > 0:
+            eps = 1e-9
+            power_band = voice_band ** 2 + eps
+            geo_mean = np.exp(np.mean(np.log(power_band)))
+            arith_mean = np.mean(power_band)
+            flatness = float(geo_mean / (arith_mean + eps))
+            if flatness > flatness_threshold:
+                logger.debug(
+                    "VAD spectral flatness=%.3f > threshold=%.2f, reject as noise",
+                    flatness, flatness_threshold,
+                )
+                return False
+
+        return True
+
     def is_speech(self, audio_bytes: bytes) -> bool:
         """判断当前帧是否为语音。优先使用 FSMN-VAD，不可用时降级为能量阈值。"""
         if len(audio_bytes) < 2:
@@ -53,7 +95,10 @@ class VADDetector:
                     disable_pbar=True,
                 )
                 # result[0]["value"] 为语音时间戳列表，非空即为语音帧
-                return bool(result and result[0].get("value"))
+                is_fsmn_speech = bool(result and result[0].get("value"))
+                if is_fsmn_speech:
+                    return self._is_likely_voice_spectrum(audio_bytes)
+                return False
             except Exception as e:
                 logger.warning("FSMN-VAD inference failed, fallback to energy: %s", e)
 
@@ -62,7 +107,9 @@ class VADDetector:
         energy_threshold = cfg.get("vad_energy_threshold", 500)
         samples = struct.unpack_from(f"{len(audio_bytes) // 2}h", audio_bytes)
         rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
-        return rms > energy_threshold
+        if rms <= energy_threshold:
+            return False
+        return self._is_likely_voice_spectrum(audio_bytes)
 
     def process_speech(self, speech: bool) -> bool:
         """基于已计算出的 speech 状态更新打断计时，返回是否触发打断。"""

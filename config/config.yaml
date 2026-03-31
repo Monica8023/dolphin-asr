@@ -32,6 +32,12 @@ asr_decoder_chunk_look_back: 0
 intent_epoch_guard_enabled: true
 asr_workers: 8
 vad_energy_threshold: 500
-asr_noise_hangover_ms: 200
-asr_max_skip_ms: 120
 vad_min_speech_ms: 120
+# 语音频带能量占比阈值：低于此值认为是宽频噪音（0.0 关闭此功能）
+vad_voice_band_ratio: 0.65
+# 谱平坦度上限：高于此值认为是稳态噪音（0.0 关闭；人声约 0.1~0.4，稳态噪音约 0.6~0.9）
+vad_spectral_flatness_max: 0.6
+# 语音结束后继续缓冲音频的时长（ms），防止结尾被截断
+asr_noise_hangover_ms: 200
+# ASR 文本后置过滤：识别结果字符数低于此值时丢弃（过滤单字/噪音误触发），0 关闭
+asr_min_text_len: 2

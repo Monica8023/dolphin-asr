@@ -30,9 +30,8 @@ DEFAULT_CONFIG = {
     "intent_epoch_guard_enabled": True,
     "asr_workers": 8,
     "vad_energy_threshold": 500,
-    "asr_noise_hangover_ms": 200,
-    "asr_max_skip_ms": 120,
     "vad_min_speech_ms": 120,
+    "vad_voice_band_ratio": 0.35,
 }
 
 _config: dict[str, Any] = {}

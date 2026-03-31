@@ -45,8 +45,7 @@ class StreamHandler:
         self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
         self._word_count: int | None = 2
         self._question_similarity: float | None = None
-        self._asr_hangover_ms: int = cfg.get("asr_noise_hangover_ms", 240)
-        self._asr_max_skip_ms: int = cfg.get("asr_max_skip_ms", 600)
+
 
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         self._asr = ASREngine()
@@ -69,6 +68,8 @@ class StreamHandler:
         # 停顿检测状态
         self._in_speech: bool = False
         self._last_speech_end_ms: int | None = None
+        # 音频缓冲 hangover 专用：记录最后一次 is_speech=True 的 monotonic 时刻
+        self._last_speech_mono: float | None = None
 
         # 计时器
         self._no_answer_task: asyncio.Task | None = None
@@ -198,6 +199,7 @@ class StreamHandler:
         self._sentence_audio_buffer.clear()  # [新增] 清空音频缓冲
         self._in_speech = False
         self._last_speech_end_ms = None
+        self._last_speech_mono = None
         self._first_text_received = False
         if self._match_timeout_task:
             self._match_timeout_task.cancel()
@@ -271,6 +273,10 @@ class StreamHandler:
         is_speech = await loop.run_in_executor(self._executor, self._vad.is_speech, audio_bytes)
         logger.debug("call_id=%s step1 is_speech=%s", self.call_id, is_speech)
 
+        # 更新 hangover 专用时间戳：每次 is_speech=True 都刷新
+        if is_speech:
+            self._last_speech_mono = time.monotonic()
+
         # 1.5 打断检测（基于 step1 的 is_speech，不重复跑 VAD）
         if self._interrupt_enabled:
             in_ignore_window = time.monotonic() < self._interrupt_allow_after
@@ -289,9 +295,40 @@ class StreamHandler:
         else:
             logger.debug("call_id=%s step1.5 interrupt check skipped: interrupt_enabled=false", self.call_id)
 
+        # 1.8 连续帧门控：is_speech=True 但连续时长不足 vad_min_speech_ms 时跳过 ASR
+        vad_min_speech_ms = cfg.get("vad_min_speech_ms", 120)
+        speech_duration_ms = 0.0
+        if is_speech and self._vad._speech_start is not None:
+            speech_duration_ms = (time.monotonic() - self._vad._speech_start) * 1000
+        skip_asr = is_speech and speech_duration_ms < vad_min_speech_ms
+        if skip_asr:
+            logger.debug(
+                "call_id=%s step1.8 skip asr: speech_duration_ms=%.0f < vad_min_speech_ms=%d",
+                self.call_id, speech_duration_ms, vad_min_speech_ms,
+            )
+
+        # 1.9 音频缓冲门控：仅 is_speech=True 或处于 hangover 窗口内时缓冲，过滤纯静音/噪音帧
+        # 使用独立的 _last_speech_mono 时间戳，与停顿检测的 _last_speech_end_ms 解耦
+        hangover_ms = cfg.get("asr_noise_hangover_ms", 200)
+        in_hangover = (
+            not is_speech
+            and self._last_speech_mono is not None
+            and (time.monotonic() - self._last_speech_mono) * 1000 <= hangover_ms
+        )
+        if is_speech or in_hangover:
+            self._sentence_audio_buffer.extend(audio_bytes)
+            logger.debug(
+                "call_id=%s step1.9 audio buffered: is_speech=%s in_hangover=%s buf_bytes=%d",
+                self.call_id, is_speech, in_hangover, len(self._sentence_audio_buffer),
+            )
+
         # 2. 流式 ASR 转写（每帧送入，模型内部积累足够 chunk 后返回文本）
         logger.debug("call_id=%s step2 asr transcribe start", self.call_id)
-        text = await loop.run_in_executor(self._executor, self._asr.transcribe, audio_bytes)
+        text = (
+            ""
+            if skip_asr
+            else await loop.run_in_executor(self._executor, self._asr.transcribe, audio_bytes)
+        )
         if text:
             self._reset_no_answer_timer()
             logger.info("call_id=%s step2 no_answer timer reset", self.call_id)
@@ -340,6 +377,23 @@ class StreamHandler:
 
                     # 如果离线模型吐出了有效文本，则覆盖；否则降级保留原本的在线结果
                     sentence = offline_sentence if offline_sentence else online_sentence
+
+                    # 后置文本噪音过滤：过短文本大概率是噪音/旁人说话误触发，直接丢弃
+                    asr_min_text_len = cfg.get("asr_min_text_len", 2)
+                    stripped = sentence.strip()
+                    if len(stripped) < asr_min_text_len:
+                        logger.info(
+                            "call_id=%s step3 sentence filtered (too short, len=%d < asr_min_text_len=%d): %r",
+                            self.call_id, len(stripped), asr_min_text_len, stripped,
+                        )
+                        self._sentence_parts = []
+                        self._sentence_start_ms = end_ms
+                        self._in_speech = False
+                        self._last_speech_end_ms = None
+                        self._sentence_epoch += 1
+                        self._reset_sentence_state()
+                        self._elapsed_ms = end_ms
+                        return
 
                     self._sentence_parts = []
                     self._sentence_start_ms = end_ms
