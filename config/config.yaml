@@ -32,3 +32,6 @@ asr_decoder_chunk_look_back: 0
 intent_epoch_guard_enabled: true
 asr_workers: 8
 vad_energy_threshold: 500
+
+# VAD 门控 ASR：VAD 判为非语音的帧不送入 ASR，从根本上拦截噪音识别（true=开启）
+vad_gate_asr: false

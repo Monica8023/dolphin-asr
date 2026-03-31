@@ -44,6 +44,7 @@ class StreamHandler:
         self._interrupt_threshold_ms: int = cfg.get("vad_interrupt_threshold_ms", 2000)
         self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
         self._word_count: int = 2
+        self._question_similarity: float | None = None
 
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         self._asr = ASREngine()
@@ -258,9 +259,14 @@ class StreamHandler:
         else:
             logger.debug("call_id=%s step1.5 interrupt check skipped: interrupt_enabled=false", self.call_id)
 
-        # 2. 流式 ASR 转写（每帧送入，模型内部积累足够 chunk 后返回文本）
-        logger.debug("call_id=%s step2 asr transcribe start", self.call_id)
+        # 2. 流式 ASR 转写：音频帧必须完整送入以维持模型内部状态连续性
+        # VAD 门控在输出侧：有文字但 VAD 判为非语音时丢弃文字，而非丢弃音频帧
+        logger.debug("call_id=%s step2 asr transcribe start (is_speech=%s)", self.call_id, is_speech)
         text = await loop.run_in_executor(self._executor, self._asr.transcribe, audio_bytes)
+        vad_gate_asr = cfg.get("vad_gate_asr", False)
+        if text and vad_gate_asr and not is_speech:
+            logger.info("call_id=%s step2 asr text suppressed by VAD gate: %r", self.call_id, text)
+            text = ""
         if text:
             self._reset_no_answer_timer()
             logger.info("call_id=%s step2 no_answer timer reset", self.call_id)
@@ -340,7 +346,9 @@ class StreamHandler:
             "model_id": self.model_id,
         }
         if self._word_count is not None:
-            payload["type_threshold"] = self._word_count
+            payload["word_count"] = self._word_count
+        if self._question_similarity is not None:
+            payload["question_similarity"] = self._question_similarity
         logger.debug("call_id=%s step3 intent payload=%s epoch=%s", self.call_id, payload, sentence_epoch)
         try:
             resp = await self._http_client.post(url, json=payload)
