@@ -75,12 +75,6 @@ class ASREngine:
             if result and result[0].get("text"):
                 text = result[0]["text"].strip()
                 if text:
-                    score = result[0].get("score", result[0].get("am_score", None))
-                    logger.debug("asr chunk text=%r score=%s result_keys=%s", text, score, list(result[0].keys()))
-                    confidence_threshold = cfg.get("asr_confidence_threshold", -999.0)
-                    if score is not None and confidence_threshold > -999.0 and score < confidence_threshold:
-                        logger.info("asr chunk low confidence score=%.3f < threshold=%.3f, drop: %r", score, confidence_threshold, text)
-                        continue
                     texts.append(text)
 
         if is_final:
@@ -98,13 +92,7 @@ class ASREngine:
             if result and result[0].get("text"):
                 text = result[0]["text"].strip()
                 if text:
-                    score = result[0].get("score", result[0].get("am_score", None))
-                    logger.debug("asr final text=%r score=%s", text, score)
-                    confidence_threshold = cfg.get("asr_confidence_threshold", -999.0)
-                    if score is not None and confidence_threshold > -999.0 and score < confidence_threshold:
-                        logger.info("asr final low confidence score=%.3f < threshold=%.3f, drop: %r", score, confidence_threshold, text)
-                    else:
-                        texts.append(text)
+                    texts.append(text)
 
         return "".join(texts)
 
