@@ -42,12 +42,7 @@ class OfflineASREngine:
                 disable_pbar=True,
             )
             if result and len(result) > 0 and result[0].get("text"):
-                score = result[0].get("score", None)
-                logger.debug("offline asr score=%s result_keys=%s", score, list(result[0].keys()))
-                confidence_threshold = cfg.get("asr_offline_confidence_threshold", -999.0)
-                if score is not None and confidence_threshold > -999.0 and score < confidence_threshold:
-                    logger.info("offline asr low confidence score=%.3f < threshold=%.3f, drop sentence", score, confidence_threshold)
-                    return ""
+                logger.info("Offline ASR result: %s", result[0])
                 return "".join(result[0]["text"].split())
         except Exception as e:
             logger.error("Offline ASR inference failed: %s", e)
