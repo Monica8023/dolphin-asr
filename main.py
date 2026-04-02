@@ -3,7 +3,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 import redis.asyncio as aioredis
@@ -19,8 +19,21 @@ from asr.stream_handler import StreamHandler
 
 logger = logging.getLogger(__name__)
 
-# P0-fix-1: 全局线程池，供 run_in_executor 执行 CPU 密集型推理
-_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("ASR_WORKERS", str(cfg.get("asr_workers", 8)))))
+class _Executors(NamedTuple):
+    vad: ThreadPoolExecutor
+    asr: ThreadPoolExecutor
+
+
+def _build_executors() -> _Executors:
+    vad_workers = int(os.environ.get("VAD_WORKERS", str(cfg.get("vad_workers", 4))))
+    asr_workers = int(os.environ.get("ASR_WORKERS", str(cfg.get("asr_workers", 8))))
+    return _Executors(
+        vad=ThreadPoolExecutor(max_workers=vad_workers, thread_name_prefix="vad"),
+        asr=ThreadPoolExecutor(max_workers=asr_workers, thread_name_prefix="asr"),
+    )
+
+
+_executors = _build_executors()
 
 
 class IntentTestRequest(BaseModel):
@@ -46,7 +59,7 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_keepalive_connections=100, max_connections=500),
         timeout=httpx.Timeout(5.0),
     )
-    app.state.executor = _executor
+    app.state.executor = _executors
 
     # Redis 客户端（per-call 配置从 Redis 拉取）
     app.state.redis = aioredis.from_url(
@@ -61,7 +74,8 @@ async def lifespan(app: FastAPI):
 
     await app.state.http_client.aclose()
     await app.state.redis.aclose()
-    _executor.shutdown(wait=False)
+    _executors.vad.shutdown(wait=False)
+    _executors.asr.shutdown(wait=False)
     logger.info("dolphin-asr service stopped.")
 
 
@@ -164,7 +178,8 @@ async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0, model_id: in
         uuid=uuid,
         model_id=model_id,
         http_client=websocket.app.state.http_client,
-        executor=websocket.app.state.executor,
+        vad_executor=websocket.app.state.executor.vad,
+        asr_executor=websocket.app.state.executor.asr,
     )
     logger.info("WebSocket connected: call_id=%s", call_id)
     try:

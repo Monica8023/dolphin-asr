@@ -27,15 +27,17 @@ class StreamHandler:
 
     P0 优化：
     - http_client: 外部注入的全局 httpx.AsyncClient，复用连接池
-    - executor: 外部注入的 ThreadPoolExecutor，将 CPU 密集推理移出事件循环
+    - vad_executor: 专用线程池，低延迟，供 RNNoise + FSMN-VAD 使用
+    - asr_executor: 专用线程池，高吞吐，供在线/离线 Paraformer 使用
     """
 
-    def __init__(self, call_id: int, uuid: int, model_id: int, http_client: httpx.AsyncClient, executor: Executor):
+    def __init__(self, call_id: int, uuid: int, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor):
         self.call_id = call_id
         self.uuid = uuid
         self.model_id = model_id
         self._http_client = http_client
-        self._executor = executor
+        self._vad_executor = vad_executor
+        self._asr_executor = asr_executor
 
         # 初始化时先用全局配置，start 事件后由 load_conf() 覆盖
         self._silence_max_ms: int = cfg.get("silence_max_ms", 800)
@@ -213,7 +215,7 @@ class StreamHandler:
         loop = asyncio.get_running_loop()
 
         # [修改] 获取流式模型最后的 flush
-        text = await loop.run_in_executor(self._executor, self._asr.transcribe, b"", True)
+        text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, b"", True)
         if text:
             self._sentence_parts.append(text)
 
@@ -222,7 +224,7 @@ class StreamHandler:
         # [新增] 如果缓冲区有残留音频，尝试用离线模型做最后一次高精度识别
         if self._sentence_audio_buffer:
             final_audio = bytes(self._sentence_audio_buffer)
-            offline_text = await loop.run_in_executor(self._executor, self._offline_asr.transcribe, final_audio)
+            offline_text = await loop.run_in_executor(self._asr_executor, self._offline_asr.transcribe, final_audio)
             if offline_text:
                 final_sentence = offline_text
 
@@ -245,7 +247,7 @@ class StreamHandler:
 
         # 0. RNNoise 降噪预处理（executor 中执行，不阻塞事件循环）
         audio_bytes, _vad_prob = await loop.run_in_executor(
-            self._executor, self._denoiser.process, audio_bytes
+            self._vad_executor, self._denoiser.process, audio_bytes
         )
         _t1 = time.monotonic()
         if not audio_bytes:
@@ -273,7 +275,7 @@ class StreamHandler:
         )
 
         # 1. 单次 VAD 语音判定（后续打断与停顿逻辑复用）
-        is_speech = await loop.run_in_executor(self._executor, self._vad.is_speech, audio_bytes)
+        is_speech = await loop.run_in_executor(self._vad_executor, self._vad.is_speech, audio_bytes)
         _t2 = time.monotonic()
         logger.debug("call_id=%s step1 is_speech=%s", self.call_id, is_speech)
 
@@ -286,10 +288,10 @@ class StreamHandler:
             if in_ignore_window:
                 logger.debug("call_id=%s step1.5 interrupt check skipped: in ignore window", self.call_id)
                 # 仍需驱动 process_speech 以维护 VAD 内部状态，但不触发打断
-                await loop.run_in_executor(self._executor, self._vad.process_speech, is_speech)
+                await loop.run_in_executor(self._vad_executor, self._vad.process_speech, is_speech)
             else:
                 logger.debug("call_id=%s step1.5 interrupt check start", self.call_id)
-                should_interrupt = await loop.run_in_executor(self._executor, self._vad.process_speech, is_speech)
+                should_interrupt = await loop.run_in_executor(self._vad_executor, self._vad.process_speech, is_speech)
                 logger.debug("call_id=%s step1.5 interrupt check result: should_interrupt=%s", self.call_id,
                              should_interrupt)
                 if should_interrupt:
@@ -304,7 +306,7 @@ class StreamHandler:
         if is_speech:
             # 只有 VAD 判定这帧里有讲话声，才喂给在线 Paraformer。
             logger.debug("call_id=%s step2 asr transcribe start (is_speech=True)", self.call_id)
-            text = await loop.run_in_executor(self._executor, self._asr.transcribe, audio_bytes)
+            text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, audio_bytes)
         else:
             # 纯噪音直接 Drop 掉，连推理都不做。
             # 这能彻底杜绝 ASR 强行在底噪里找发音造成的"蹦出毫无关联的杂字"（幻觉）现象。
@@ -366,7 +368,7 @@ class StreamHandler:
 
                     _offline_start = time.monotonic()
                     logger.info("call_id=%s step3 offline ASR start: audio_bytes=%d", self.call_id, len(sentence_audio))
-                    offline_sentence = await loop.run_in_executor(self._executor, self._offline_asr.transcribe,
+                    offline_sentence = await loop.run_in_executor(self._asr_executor, self._offline_asr.transcribe,
                                                                   sentence_audio)
                     _offline_ms = int((time.monotonic() - _offline_start) * 1000)
                     logger.info("call_id=%s step3 offline ASR done: cost=%dms result=%r", self.call_id, _offline_ms, offline_sentence)
