@@ -3,7 +3,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any, NamedTuple
+from typing import Any
 
 import httpx
 import redis.asyncio as aioredis
@@ -16,12 +16,14 @@ from asr.engine import load_model
 from asr.vad import load_vad_model
 from asr.offline_engine import load_offline_model
 from asr.stream_handler import StreamHandler
+from asr.enhancer import load_enhancer_model
 
 logger = logging.getLogger(__name__)
 
-class _Executors(NamedTuple):
-    vad: ThreadPoolExecutor
-    asr: ThreadPoolExecutor
+class _Executors:
+    def __init__(self, vad: ThreadPoolExecutor, asr: ThreadPoolExecutor):
+        self.vad = vad
+        self.asr = asr
 
 
 def _build_executors() -> _Executors:
@@ -31,9 +33,6 @@ def _build_executors() -> _Executors:
         vad=ThreadPoolExecutor(max_workers=vad_workers, thread_name_prefix="vad"),
         asr=ThreadPoolExecutor(max_workers=asr_workers, thread_name_prefix="asr"),
     )
-
-
-_executors = _build_executors()
 
 
 class IntentTestRequest(BaseModel):
@@ -53,13 +52,19 @@ async def lifespan(app: FastAPI):
     load_model()
     load_vad_model()
     load_offline_model()
+    load_enhancer_model()
+
+    # 每个 worker 进程在 lifespan 内独立创建 executor，避免 fork 后继承父进程线程池
+    executors = _build_executors()
+    logger.info("dolphin-asr worker pid=%d executors: vad=%d asr=%d", os.getpid(),
+                executors.vad._max_workers, executors.asr._max_workers)
 
     # P0-fix-3: 全局 httpx 连接池，所有 StreamHandler 共用
     app.state.http_client = httpx.AsyncClient(
         limits=httpx.Limits(max_keepalive_connections=100, max_connections=500),
         timeout=httpx.Timeout(5.0),
     )
-    app.state.executor = _executors
+    app.state.executor = executors
 
     # Redis 客户端（per-call 配置从 Redis 拉取）
     app.state.redis = aioredis.from_url(
@@ -74,8 +79,8 @@ async def lifespan(app: FastAPI):
 
     await app.state.http_client.aclose()
     await app.state.redis.aclose()
-    _executors.vad.shutdown(wait=False)
-    _executors.asr.shutdown(wait=False)
+    executors.vad.shutdown(wait=False)
+    executors.asr.shutdown(wait=False)
     logger.info("dolphin-asr service stopped.")
 
 

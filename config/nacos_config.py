@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "log_level": "INFO",
     "asr_model_path": "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
     "vad_model_path": "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    "enhancer_model_path": "D:\model\iic\speech_zipenhancer_ans_multiloss_16k_base",
     "offline_asr_model_path":"D:/model/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
     "asr_device": "cpu",
     "asr_chunk_size": [0, 6, 2],

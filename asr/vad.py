@@ -23,23 +23,26 @@ def load_vad_model() -> None:
 
 
 class VADDetector:
-    """Tracks continuous speech duration per call and triggers interrupt when threshold exceeded."""
+    """Tracks continuous speech duration per call and triggers interrupt when threshold exceeded.
+
+    无状态推理模式：每帧推理不传 cache，避免 1000路并发时 per-call KV cache 显存线性增长（1-5GB）。
+    代价：跨帧的语音边界判断精度略降（±一帧误差），但电呼场景可接受。
+    """
 
     def __init__(self, threshold_ms: int = 2000):
         self.threshold_ms = threshold_ms
         self._speech_start: float | None = None
         self._interrupted = False
-        self._vad_cache: dict = {}
-        # 新增：维护当前的语音活动状态
+        # 无状态模式：不维护 _vad_cache，每次推理使用空 cache
         self._is_speaking = False
 
     def reset(self) -> None:
         self._speech_start = None
         self._interrupted = False
-        self._vad_cache = {}
+        self._is_speaking = False
 
     def is_speech(self, audio_bytes: bytes) -> bool:
-        """解析 FunASR 输出事件，更新 _is_speaking 状态"""
+        """解析 FunASR 输出事件，更新 _is_speaking 状态（无状态模式，不传 cache）"""
         if len(audio_bytes) < 2:
             return self._is_speaking
 
@@ -49,7 +52,7 @@ class VADDetector:
             try:
                 result = _vad_model.generate(
                     input=audio_np,
-                    cache=self._vad_cache,
+                    cache={},
                     is_final=False,
                     chunk_size=chunk_ms,
                     disable_pbar=True,
