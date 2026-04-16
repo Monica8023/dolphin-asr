@@ -19,10 +19,10 @@ DEFAULT_CONFIG = {
     "no_answer_timeout_ms": 10000,
     "match_timeout_ms": 15000,
     "log_path": "./log",
-    "log_level": "INFO",
+    "log_level": "debug",
     "asr_model_path": "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
     "vad_model_path": "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-    "enhancer_model_path": "D:\model\iic\speech_zipenhancer_ans_multiloss_16k_base",
+    "enhancer_model_path": "D:/model/iic/speech_zipenhancer_ans_multiloss_16k_base",
     "offline_asr_model_path":"D:/model/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
     "asr_device": "cpu",
     "asr_chunk_size": [0, 6, 2],
@@ -30,9 +30,9 @@ DEFAULT_CONFIG = {
     "asr_decoder_chunk_look_back": 0,
     "intent_epoch_guard_enabled": True,
     "asr_workers": 8,
+    "vad_workers": 4,
     "vad_energy_threshold": 500,
-    "vad_min_speech_ms": 120,
-    "vad_voice_band_ratio": 0.35,
+    "vad_gate_asr": False,
 }
 
 _config: dict[str, Any] = {}

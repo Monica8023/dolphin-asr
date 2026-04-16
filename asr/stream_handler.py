@@ -32,7 +32,7 @@ class StreamHandler:
     - asr_executor: 专用线程池，高吞吐，供在线/离线 Paraformer 使用
     """
 
-    def __init__(self, call_id: int, uuid: int, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor):
+    def __init__(self, call_id: str, uuid: str, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor):
         self.call_id = call_id
         self.uuid = uuid
         self.model_id = model_id

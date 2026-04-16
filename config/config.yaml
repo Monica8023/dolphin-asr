@@ -23,16 +23,18 @@ log_level: "INFO"
 # FunASR 模型配置（路径通过此处配置，支持 Nacos 热更新）
 asr_model_path: "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
 vad_model_path: "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-enhancer_model_path: "D:\model\iic\speech_zipenhancer_ans_multiloss_16k_base"
-offline_asr_model_path: "D:/models/paraformer-onnx"
+enhancer_model_path: "D:/model/iic/speech_zipenhancer_ans_multiloss_16k_base"
+offline_asr_model_path: "D:/model/iic/funasr_finetune_offline"
 asr_device: "cpu"
 # 流式推理分块参数：[lookback, current, lookahead]（单位：LFR 帧，1帧≈60ms）
-asr_chunk_size: [0, 6, 2]
-asr_encoder_chunk_look_back: 2
-asr_decoder_chunk_look_back: 0
+# current=2 → chunk_stride=120ms，首词延迟从 ~480ms 降至 ~240ms；look_back 增大补偿精度
+asr_chunk_size: [0, 2, 1]
+asr_encoder_chunk_look_back: 4
+asr_decoder_chunk_look_back: 1
 intent_epoch_guard_enabled: true
 asr_workers: 8
 vad_workers: 4
+enhancer_workers: 2
 vad_energy_threshold: 500
 
 # VAD 门控 ASR：VAD 判为非语音的帧不送入 ASR，从根本上拦截噪音识别（true=开启）
