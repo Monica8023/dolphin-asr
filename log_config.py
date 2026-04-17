@@ -30,3 +30,7 @@ def setup_logging() -> None:
         root.addHandler(file_handler)
     if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root.handlers):
         root.addHandler(console_handler)
+
+    # 屏蔽第三方库（FunASR / ModelScope）的内部日志，只保留 WARNING 及以上
+    for noisy_logger in ("funasr", "modelscope", "modelscope.pipelines"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)

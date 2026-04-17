@@ -3,11 +3,10 @@
 使用 FunASR iic/speech_frcrn_ans_cirm_16k 模型，
 对 16kHz PCM16 音频做端到端语音增强（ANS）。
 
-高并发优化说明：
-- 采用 FunASR 原生 AutoModel 引擎
-- 纯内存 Numpy 矩阵运算，零 IO 开销，无临时文件
-- 完全规避 ModelScope Pipeline 的类型校验壁垒
+入口统一上采样后，本模块不再做任何采样率转换，直接处理 16kHz。
 """
+import contextlib
+import io
 import logging
 import numpy as np
 from config import nacos_config as cfg
@@ -22,13 +21,10 @@ def load_enhancer_model() -> None:
     from modelscope.pipelines import pipeline
     from modelscope.utils.constant import Tasks
 
-    # 改为 FRCRN 模型路径
     model_path = cfg.get("enhancer_model_path", "iic/speech_frcrn_ans_cirm_16k")
     device = cfg.get("asr_device", "cpu")
 
     logger.info("Loading FRCRN Enhancer model from %s on device=%s", model_path, device)
-
-    # 恢复使用 FunASR 的 AutoModel 加载
     _enhancer_model = pipeline(
         Tasks.acoustic_noise_suppression,
         model=model_path,
@@ -37,15 +33,7 @@ def load_enhancer_model() -> None:
     logger.info("FRCRN Enhancer model loaded.")
 
 def create_wav_header(dataflow, sample_rate=16000, num_channels=1, bits_per_sample=16):
-    """
-    创建WAV文件头的字节串。
-
-    :param dataflow: 音频bytes数据（以字节为单位）。
-    :param sample_rate: 采样率，默认16000。
-    :param num_channels: 声道数，默认1（单声道）。
-    :param bits_per_sample: 每个样本的位数，默认16。
-    :return: WAV文件头的字节串和音频bytes数据。
-    """
+    """创建 WAV 文件头。"""
     total_data_len = len(dataflow)
     byte_rate = sample_rate * num_channels * bits_per_sample // 8
     block_align = num_channels * bits_per_sample // 8
@@ -53,58 +41,79 @@ def create_wav_header(dataflow, sample_rate=16000, num_channels=1, bits_per_samp
     fmt_chunk_size = 16
     riff_chunk_size = 4 + (8 + fmt_chunk_size) + (8 + data_chunk_size)
 
-    # 使用 bytearray 构建字节串
     header = bytearray()
-
-    # RIFF/WAVE header
     header.extend(b'RIFF')
     header.extend(riff_chunk_size.to_bytes(4, byteorder='little'))
     header.extend(b'WAVE')
-
-    # fmt subchunk
     header.extend(b'fmt ')
     header.extend(fmt_chunk_size.to_bytes(4, byteorder='little'))
-    header.extend((1).to_bytes(2, byteorder='little'))  # Audio format (1 is PCM)
+    header.extend((1).to_bytes(2, byteorder='little'))
     header.extend(num_channels.to_bytes(2, byteorder='little'))
     header.extend(sample_rate.to_bytes(4, byteorder='little'))
     header.extend(byte_rate.to_bytes(4, byteorder='little'))
     header.extend(block_align.to_bytes(2, byteorder='little'))
     header.extend(bits_per_sample.to_bytes(2, byteorder='little'))
-
-    # data subchunk
     header.extend(b'data')
     header.extend(data_chunk_size.to_bytes(4, byteorder='little'))
 
     return bytes(header) + dataflow
 
-class SpeechEnhancer:
-    """无状态语音增强引擎，可直接复用全局模型实例。
 
-    输入：16kHz PCM16 音频（任意长度，建议分块）
-    输出：增强后的 16kHz PCM16 音频
+class SpeechEnhancer:
+    """带缓冲的语音增强引擎，复用全局 FRCRN 模型实例。
+
+    输入/输出均为 16kHz PCM16（由 stream_handler 入口统一上采样后传入）。
+    内部不做任何采样率转换，直接送入 FRCRN 推理。
+
+    缓冲阈值：_BUFFER_THRESHOLD_SAMPLES samples @ 16kHz
+    默认 3200 samples = 200ms，在延迟与推理效率之间取平衡。
     """
+
+    # 3200 samples @ 16kHz = 200ms
+    _BUFFER_THRESHOLD_SAMPLES = int(cfg.get("enhancer_buffer_samples", 3200))
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def reset(self) -> None:
+        """句子结束 / 通话重置时清空缓冲，防止跨句串扰。"""
+        self._buffer.clear()
 
     def enhance(self, audio_bytes: bytes) -> bytes:
         """
-        对整段 PCM16 音频做语音增强降噪。
+        喂入一帧 16kHz PCM16 音频，返回增强后的 16kHz PCM16 音频。
 
-        audio_bytes: 16kHz, 16-bit PCM, mono, little-endian
-        返回：增强后相同格式的 PCM16 bytes；模型未加载或失败时返回原始音频。
+        缓冲未满时返回 b""；达到阈值后批量推理并返回结果。
+        模型未加载或推理失败时原样返回，保证通话链路绝不中断。
         """
         if _enhancer_model is None or not audio_bytes:
             return audio_bytes
 
-        # 1. 极速内存解析：将二进制直接映射为 float32 的 numpy 数组
-        # FunASR 内部的声学特征提取器要求输入的是归一化到 [-1.0, 1.0] 的 float32 数据
-        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        self._buffer.extend(audio_bytes)
+
+        if len(self._buffer) // 2 < self._BUFFER_THRESHOLD_SAMPLES:
+            return b""
+
+        batch_bytes = bytes(self._buffer)
+        self._buffer.clear()
 
         try:
-            # 2. 纯内存推理：FunASR 完美接受 ndarray 作为 input
-            result = _enhancer_model(create_wav_header(audio_bytes, sample_rate=16000, num_channels=1, bits_per_sample=16))
-            return result['output_pcm']
+            # 直接构建 16kHz WAV Header 送入 FRCRN（无需采样率转换）
+            _devnull = io.StringIO()
+            with contextlib.redirect_stdout(_devnull):
+                result = _enhancer_model(
+                    create_wav_header(batch_bytes, sample_rate=16000)
+                )
+            enhanced = result['output_pcm']
+
+            if isinstance(enhanced, np.ndarray):
+                enhanced_np = enhanced.flatten().astype(np.float32)
+            else:
+                enhanced_np = np.frombuffer(enhanced, dtype=np.int16).astype(np.float32)
+
+            return np.clip(enhanced_np, -32768, 32767).astype(np.int16).tobytes()
 
         except Exception as e:
             logger.warning("FRCRN inference failed, returning original audio: %s", e)
 
-        # 任何环节失败，原样退回声音，保证通话链路绝对不断
-        return audio_bytes
+        return batch_bytes

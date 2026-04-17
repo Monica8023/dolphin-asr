@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 # RNNoise 帧大小（48kHz 下 480 samples = 10ms）
 _RNNOISE_FRAME_SIZE = 480
 _RNNOISE_RATE = 48000
-_ASR_RATE = 16000
-# 重采样比：48k/16k = 3/1
-_UP = 3
+_ASR_RATE = 8000
+# 重采样比：48k/8k = 6/1
+_UP = 6
 _DOWN = 1
 
 

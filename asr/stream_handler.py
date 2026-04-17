@@ -5,6 +5,7 @@ from concurrent.futures import Executor
 from typing import Any
 
 import httpx
+import numpy as np
 
 from asr.denoiser import RNNoiseFilter
 from asr.engine import ASREngine
@@ -80,6 +81,17 @@ class StreamHandler:
 
         # 打断前置禁区：resume() 时记录起始时刻
         self._interrupt_allow_after: float = 0.0
+
+        # 积压延迟可观测：音频时间轴 vs 墙上时钟的偏差
+        self._audio_lag_wall: float | None = None   # 第一帧处理时的墙上时刻
+        self._audio_lag_base_ms: int = 0            # 第一帧对应的 end_ms
+
+        # ASR 异步化：最优策略（best-effort single-task）
+        # 同一时刻只跑一个 ASR 任务；忙时跳过的音频积累到 _asr_skip_buffer，
+        # 下一次有空时把积压帧拼到当前帧头部一起送入，保留上下文不丢字。
+        self._asr_running: bool = False
+        self._asr_skip_buffer: bytearray = bytearray()
+        self._pending_asr: int = 0  # 仅用于日志观测
 
     def start_timers(self) -> None:
         """连接建立后调用，启动无应答计时器。"""
@@ -201,16 +213,22 @@ class StreamHandler:
     def _reset_sentence_state(self) -> None:
         """每句话处理完毕后调用，重置句子级状态，允许持续识别下一句。"""
         self._sentence_parts = []
-        self._sentence_audio_buffer.clear()  # [新增] 清空音频缓冲
+        self._sentence_audio_buffer.clear()
         self._in_speech = False
         self._last_speech_end_ms = None
         self._first_text_received = False
+        self._audio_lag_wall = None
+        self._audio_lag_base_ms = 0
+        # 重置 best-effort ASR 状态：在途任务仍会完成，但 _paused/epoch 检查会过滤结果
+        self._asr_running = False
+        self._asr_skip_buffer.clear()
         if self._match_timeout_handle:
             self._match_timeout_handle.cancel()
             self._match_timeout_handle = None
         self._asr.reset()
         self._vad.reset()
-        self._denoiser.reset()  # 清空余量，防止句间串扰
+        self._denoiser.reset()
+        self._enhancer.reset()
 
     async def close(self) -> None:
         """连接断开时调用：刷新模型内部缓冲区，处理最后一帧剩余文本。"""
@@ -250,12 +268,19 @@ class StreamHandler:
         loop = asyncio.get_running_loop()
         _t0 = time.monotonic()
 
-        # 0. 降噪预处理（executor 中执行，不阻塞事件循环）
-        #  0.1 RNNoise算法降噪
-        # audio_bytes, _vad_prob = await loop.run_in_executor(
-        #     self._vad_executor, self._denoiser.process, audio_bytes
-        # )
-        # 0.1 ZipEnhancer模型降噪
+        # 0. 入口采样率适配：仅在输入非 16kHz 时做上采样，16kHz 直接透传
+        input_sr: int = cfg.get("audio_input_sample_rate", 8000)
+        if input_sr != 16000:
+            try:
+                import soxr
+                _arr = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                _arr_16k = soxr.resample(_arr, input_sr, 16000, quality="LQ")
+                audio_bytes = np.clip(_arr_16k, -32768, 32767).astype(np.int16).tobytes()
+            except Exception as e:
+                logger.warning("call_id=%s upsample %dHz->16kHz failed, keep original: %s",
+                               self.call_id, input_sr, e)
+
+        # 0.1 ZipEnhancer模型降噪（接收 16kHz PCM16，输出 16kHz PCM16）
         audio_bytes = await loop.run_in_executor(
             self._vad_executor, self._enhancer.enhance, audio_bytes
         )
@@ -268,20 +293,27 @@ class StreamHandler:
         num_samples = len(audio_bytes) // bytes_per_sample
         self._total_samples += num_samples
 
-        # chunk_ms = self._estimate_duration_ms(audio_bytes)
-        # end_ms = self._elapsed_ms + chunk_ms
-
         end_ms = int(self._total_samples / 16000 * 1000)
 
         # 如果有些地方依然需要 chunk_ms
         chunk_ms = end_ms - self._elapsed_ms
+
+        # 积压延迟监控：当前帧的"音频时刻"距离"理想墙上时刻"的偏差
+        # 理想情况下，end_ms 的音频应当在 end_ms 毫秒后刚好处理完；实际超出则为积压
+        now = time.monotonic()
+        if self._audio_lag_wall is None:
+            self._audio_lag_wall = now
+            self._audio_lag_base_ms = end_ms
+        audio_lag_ms = int((now - self._audio_lag_wall) * 1000) - (end_ms - self._audio_lag_base_ms)
+
         logger.debug(
-            "call_id=%s handle_audio start: bytes=%d chunk_ms=%d elapsed_ms=%d end_ms=%d",
+            "call_id=%s handle_audio start: bytes=%d chunk_ms=%d elapsed_ms=%d end_ms=%d lag=%dms",
             self.call_id,
             len(audio_bytes),
             chunk_ms,
             self._elapsed_ms,
             end_ms,
+            audio_lag_ms,
         )
 
         # 1. 单次 VAD 语音判定（后续打断与停顿逻辑复用）
@@ -311,51 +343,40 @@ class StreamHandler:
             logger.debug("call_id=%s step1.5 interrupt check skipped: interrupt_enabled=false", self.call_id)
         _t3 = time.monotonic()
 
-        # 2. 流式 ASR 转写：音频帧必须完整送入以维持模型内部状态连续性
-        text = ""
+        # 2. 流式 ASR 转写：best-effort single-task
+        # VAD 判定为语音才处理；非语音帧丢弃，防止幻觉
         if is_speech:
-            # 只有 VAD 判定这帧里有讲话声，才喂给在线 Paraformer。
-            logger.debug("call_id=%s step2 asr transcribe start (is_speech=True)", self.call_id)
-            text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, audio_bytes)
+            if self._asr_running:
+                # ASR 忙：把当前帧积压到 skip_buffer，等下一个任务取走
+                self._asr_skip_buffer.extend(audio_bytes)
+                logger.debug("call_id=%s step2 asr busy, buffered %d bytes (skip_buf=%d)",
+                             self.call_id, len(audio_bytes), len(self._asr_skip_buffer))
+            else:
+                # ASR 空闲：把积压帧拼到当前帧头部，整体送入，保留上下文
+                if self._asr_skip_buffer:
+                    combined = bytes(self._asr_skip_buffer) + audio_bytes
+                    self._asr_skip_buffer.clear()
+                else:
+                    combined = audio_bytes
+                self._asr_running = True
+                self._pending_asr += 1
+                logger.debug("call_id=%s step2 asr task fired (pending=%d)", self.call_id, self._pending_asr)
+                asyncio.create_task(self._run_asr(combined, end_ms))
         else:
-            # 纯噪音直接 Drop 掉，连推理都不做。
-            # 这能彻底杜绝 ASR 强行在底噪里找发音造成的"蹦出毫无关联的杂字"（幻觉）现象。
             logger.debug("call_id=%s step2 asr transcribe skipped (noise dropped)", self.call_id)
         _t4 = time.monotonic()
 
         logger.debug(
-            "call_id=%s handle_audio timing: denoise=%dms vad=%dms interrupt=%dms asr=%dms total=%dms",
+            "call_id=%s handle_audio timing: denoise=%dms vad=%dms interrupt=%dms asr_dispatch=%dms total=%dms lag=%dms pending_asr=%d",
             self.call_id,
             int((_t1 - _t0) * 1000),
             int((_t2 - _t1) * 1000),
             int((_t3 - _t2) * 1000),
             int((_t4 - _t3) * 1000),
             int((_t4 - _t0) * 1000),
+            audio_lag_ms,
+            self._pending_asr,
         )
-
-
-        if text:
-            self._reset_no_answer_timer()
-            logger.info("call_id=%s step2 no_answer timer reset", self.call_id)
-            if not self._first_text_received:
-                self._first_text_received = True
-                loop = asyncio.get_event_loop()
-                self._match_timeout_handle = loop.call_later(
-                    self._match_timeout_ms / 1000, self._on_match_timeout
-                )
-                logger.info("call_id=%s step2 first text received, match timer started", self.call_id)
-
-            self._sentence_parts.append(text)
-            self._all_segments.append({
-                "text": text,
-                "start_ms": self._elapsed_ms,
-                "end_ms": end_ms,
-            })
-            text_preview = text if len(text) <= 120 else f"{text[:120]}..."
-            logger.info("call_id=%s step2 asr text=%r", self.call_id, text_preview)
-
-        else:
-            logger.debug("call_id=%s step2 asr empty text", self.call_id)
 
         # 3. 停顿检测 → 句子结束判定
         if is_speech:
@@ -368,13 +389,17 @@ class StreamHandler:
             if self._in_speech and self._last_speech_end_ms is not None:
                 silence_ms = end_ms - self._last_speech_end_ms
                 logger.debug(
-                    "call_id=%s step3 silence check: silence_ms=%d threshold_ms=%d has_sentence_parts=%s",
+                    "call_id=%s step3 silence check: silence_ms=%d threshold_ms=%d"
+                    " has_audio=%s has_parts=%s pending_asr=%d",
                     self.call_id,
                     silence_ms,
                     self._silence_max_ms,
+                    bool(self._sentence_audio_buffer),
                     bool(self._sentence_parts),
+                    self._pending_asr,
                 )
-                if silence_ms >= self._silence_max_ms and self._sentence_parts:
+                # 触发条件：以 VAD 同步写入的音频缓冲为准，不依赖异步 ASR 回填
+                if silence_ms >= self._silence_max_ms and self._sentence_audio_buffer:
                     # [修改] 提取原始流式识别的句子，并同时提取音频送入离线模型纠错
                     online_sentence = "".join(self._sentence_parts)
                     sentence_audio = bytes(self._sentence_audio_buffer)
@@ -397,15 +422,66 @@ class StreamHandler:
                     sentence_epoch = self._sentence_epoch
                     self._reset_sentence_state()
 
-                    # [修改] 在原本的日志中额外增加 Online 和 Offline 的对比，方便 Debug 精度提升效果
-                    logger.info("call_id=%s step3 sentence done (silence %dms): %s (Online raw: %s)",
-                                self.call_id, silence_ms, sentence, online_sentence)
-                    logger.info("call_id=%s step3 intent task scheduled (epoch=%d)", self.call_id, sentence_epoch)
-                    asyncio.create_task(self._send_transcript(sentence))
-                    asyncio.create_task(self._call_intent(sentence, sentence_epoch))
+                    if not sentence:
+                        # VAD 触发但 ASR 无有效输出（"嗯"、噪音、短促喘气等），静默丢弃
+                        logger.info("call_id=%s step3 sentence empty (VAD false positive), skip intent", self.call_id)
+                    else:
+                        # [修改] 在原本的日志中额外增加 Online 和 Offline 的对比，方便 Debug 精度提升效果
+                        logger.info("call_id=%s step3 sentence done (silence %dms): %s (Online raw: %s)",
+                                    self.call_id, silence_ms, sentence, online_sentence)
+                        logger.info("call_id=%s step3 intent task scheduled (epoch=%d)", self.call_id, sentence_epoch)
+                        asyncio.create_task(self._send_transcript(sentence))
+                        asyncio.create_task(self._call_intent(sentence, sentence_epoch))
 
         self._elapsed_ms = end_ms
         logger.debug("call_id=%s handle_audio end: elapsed_ms=%d", self.call_id, self._elapsed_ms)
+
+    # ------------------------------------------------------------------ #
+    #  ASR 异步任务                                                         #
+    # ------------------------------------------------------------------ #
+
+    async def _run_asr(self, audio_bytes: bytes, end_ms: int) -> None:
+        """在独立 Task 中执行 ASR（best-effort single-task：同时只有一个任务在跑）。"""
+        loop = asyncio.get_running_loop()
+        _t = time.monotonic()
+        try:
+            text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, audio_bytes)
+        except Exception as e:
+            logger.warning("call_id=%s step2 asr failed: %s", self.call_id, e)
+            return
+        finally:
+            self._asr_running = False
+            self._pending_asr -= 1
+
+        asr_ms = int((time.monotonic() - _t) * 1000)
+
+        if self._paused or not text:
+            if not text:
+                logger.debug("call_id=%s step2 asr empty (async, cost=%dms)", self.call_id, asr_ms)
+            return
+
+        self._reset_no_answer_timer()
+        logger.info("call_id=%s step2 no_answer timer reset", self.call_id)
+
+        if not self._first_text_received:
+            self._first_text_received = True
+            _loop = asyncio.get_event_loop()
+            self._match_timeout_handle = _loop.call_later(
+                self._match_timeout_ms / 1000, self._on_match_timeout
+            )
+            logger.info("call_id=%s step2 first text received, match timer started", self.call_id)
+
+        self._sentence_parts.append(text)
+        self._all_segments.append({
+            "text": text,
+            "start_ms": self._elapsed_ms,
+            "end_ms": end_ms,
+        })
+        text_preview = text if len(text) <= 120 else f"{text[:120]}..."
+        logger.info(
+            "call_id=%s step2 asr text=%r (async cost=%dms pending=%d)",
+            self.call_id, text_preview, asr_ms, self._pending_asr,
+        )
 
     # ------------------------------------------------------------------ #
     #  Intent                                                              #
@@ -415,7 +491,7 @@ class StreamHandler:
         url = f"{cfg.get('intent_service_url')}/api/v1/recognize"
         payload: dict = {
             "text": sentence,
-            "call_id": str(self.call_id),
+            "call_id": self.call_id,
             "model_id": self.model_id,
         }
         if self._word_count is not None:
@@ -547,7 +623,7 @@ class StreamHandler:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _estimate_duration_ms(audio_bytes: bytes, sample_rate: int = 16000, bit_depth: int = 16) -> int:
+    def _estimate_duration_ms(audio_bytes: bytes, sample_rate: int = 8000, bit_depth: int = 16) -> int:
         bytes_per_sample = bit_depth // 8
         num_samples = len(audio_bytes) // bytes_per_sample
         return int(num_samples / sample_rate * 1000)

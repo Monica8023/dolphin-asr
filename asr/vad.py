@@ -25,63 +25,80 @@ def load_vad_model() -> None:
 class VADDetector:
     """Tracks continuous speech duration per call and triggers interrupt when threshold exceeded.
 
-    无状态推理模式：每帧推理不传 cache，避免 1000路并发时 per-call KV cache 显存线性增长（1-5GB）。
-    代价：跨帧的语音边界判断精度略降（±一帧误差），但电呼场景可接受。
+    有状态推理模式：每路通话维护独立 _vad_cache，FSMN-VAD 可跨帧累积上下文，
+    语音起止检测精度显著提升（特别是短帧 < 100ms 的场景）。
+    显存代价：每路约 1-5MB KV cache，1000路并发约 1-5GB，可通过配置控制并发数。
     """
 
     def __init__(self, threshold_ms: int = 2000):
         self.threshold_ms = threshold_ms
         self._speech_start: float | None = None
         self._interrupted = False
-        # 无状态模式：不维护 _vad_cache，每次推理使用空 cache
+        # 有状态模式：维护 per-call KV cache，跨帧积累上下文
+        self._vad_cache: dict = {}
         self._is_speaking = False
 
     def reset(self) -> None:
         self._speech_start = None
         self._interrupted = False
+        self._vad_cache = {}
         self._is_speaking = False
 
+    # FSMN-VAD 最短有效时长（毫秒）：按当前采样率动态换算为样本数
+    _MIN_VAD_MS = 25
+
     def is_speech(self, audio_bytes: bytes) -> bool:
-        """解析 FunASR 输出事件，更新 _is_speaking 状态（无状态模式，不传 cache）"""
+        """解析 FunASR 输出事件，更新 _is_speaking 状态（有状态模式，传 per-call cache）。
+        输入为 16kHz PCM16（由 stream_handler 入口统一上采样）。
+        """
         if len(audio_bytes) < 2:
             return self._is_speaking
 
         if _vad_model is not None:
-            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            chunk_ms = max(1, len(audio_np) // 16)
-            try:
-                result = _vad_model.generate(
-                    input=audio_np,
-                    cache={},
-                    is_final=False,
-                    chunk_size=chunk_ms,
-                    disable_pbar=True,
-                )
+            # 输入已为 16kHz PCM16，直接归一化，无需上采样
+            audio_for_vad = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            sample_rate = 16000
 
-                # 解析 FSMN-VAD 的事件流
-                if result and "value" in result[0]:
-                    events = result[0]["value"]
-                    for event in events:
-                        start, end = event[0], event[1]
-                        if start != -1 and end == -1:
-                            self._is_speaking = True  # 语音开始
-                        elif start == -1 and end != -1:
-                            self._is_speaking = False  # 语音结束
-                        elif start != -1 and end != -1:
-                            # 极短的一段声音（可能在一个 chunk 内开始和结束）
-                            # 可以根据需求决定是否忽略这种极短的噪音脉冲
-                            pass
-                return self._is_speaking
+            min_samples = int(sample_rate * self._MIN_VAD_MS / 1000)
 
-            except Exception as e:
-                logger.warning("FSMN-VAD inference failed, fallback to energy: %s", e)
+            if len(audio_for_vad) < min_samples:
+                logger.debug("VAD: audio too short (%d samples < %d), fallback to energy",
+                             len(audio_for_vad), min_samples)
+            else:
+                chunk_ms = max(1, len(audio_for_vad) // (sample_rate // 1000))
+                try:
+                    result = _vad_model.generate(
+                        input=audio_for_vad,
+                        cache=self._vad_cache,
+                        is_final=False,
+                        chunk_size=chunk_ms,
+                        disable_pbar=True,
+                    )
 
-        # 能量降级逻辑
+                    frame_has_speech = self._is_speaking
+                    if result and "value" in result[0]:
+                        events = result[0]["value"]
+                        for event in events:
+                            start, end = event[0], event[1]
+                            if start != -1 and end == -1:
+                                frame_has_speech = True
+                                self._is_speaking = True
+                            elif start == -1 and end != -1:
+                                frame_has_speech = True
+                                self._is_speaking = False
+                            elif start != -1 and end != -1:
+                                frame_has_speech = True
+
+                    return frame_has_speech
+
+                except Exception as e:
+                    logger.warning("FSMN-VAD inference failed, fallback to energy: %s", e)
+
+        # 能量降级逻辑（输入已为 16kHz，能量计算无需改动）
         from config import nacos_config as cfg
         energy_threshold = cfg.get("vad_energy_threshold", 1500)
         samples = struct.unpack_from(f"{len(audio_bytes) // 2}h", audio_bytes)
         rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
-        # 能量判断只能代表当前帧，你可以用它临时覆盖状态
         self._is_speaking = rms > energy_threshold
         return self._is_speaking
 

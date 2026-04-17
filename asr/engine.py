@@ -43,11 +43,12 @@ class ASREngine:
 
         from config import nacos_config as cfg
 
-        audio_np = (
-            np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            if audio_bytes
-            else np.zeros(0, dtype=np.float32)
-        )
+        if audio_bytes:
+            # 输入已为 16kHz PCM16（由 stream_handler 入口统一上采样），直接归一化
+            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            audio_np = np.zeros(0, dtype=np.float32)
+
         if audio_np.size:
             self._audio_buffer = np.concatenate((self._audio_buffer, audio_np))
 
@@ -56,7 +57,7 @@ class ASREngine:
         decoder_look_back = cfg.get("asr_decoder_chunk_look_back", 1)
 
         current_chunk = chunk_size[1] if isinstance(chunk_size, (list, tuple)) and len(chunk_size) > 1 else 10
-        chunk_stride = max(1, int(current_chunk)) * 960
+        chunk_stride = max(1, int(current_chunk)) * 480
 
         texts: list[str] = []
 
