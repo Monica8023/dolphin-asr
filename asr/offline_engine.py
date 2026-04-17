@@ -34,7 +34,6 @@ class OfflineASREngine:
         if _offline_model is None or not audio_bytes:
             return ""
 
-        # 输入已为 16kHz PCM16（由 stream_handler 入口统一上采样），直接归一化
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
         try:

@@ -1,24 +1,31 @@
 """RNNoise 实时音频降噪预处理。
 
 使用 pyrnnoise 底层 C 接口（pyrnnoise.rnnoise），绕过有兼容性问题的 audiolab 依赖。
-RNNoise 原生采样率为 48kHz，内部做 16kHz ↔ 48kHz 重采样（soxr，C 实现，比 scipy 快 5-10x）。
+RNNoise 原生采样率为 48kHz，内部做 16kHz ↔ 48kHz 重采样（scipy.signal.upfirdn，系数预计算）。
 
-安装：pip install pyrnnoise python-soxr
+安装：pip install pyrnnoise
 """
 import logging
 
 import numpy as np
-import soxr
+from scipy.signal import firwin, upfirdn
 
 logger = logging.getLogger(__name__)
 
 # RNNoise 帧大小（48kHz 下 480 samples = 10ms）
 _RNNOISE_FRAME_SIZE = 480
 _RNNOISE_RATE = 48000
-_ASR_RATE = 8000
-# 重采样比：48k/8k = 6/1
-_UP = 6
+_ASR_RATE = 16000
+# 重采样比：48k/16k = 3/1
+_UP = 3
 _DOWN = 1
+
+# 预计算 FIR 系数（模块级，进程内只算一次）
+# 上采样（×3）：低通截止 = 1/3 奈奎斯特，补偿增益 ×3
+_N_TAPS = 63  # 奇数个 tap，线性相位
+_H_UP = firwin(_N_TAPS, 1.0 / _UP, window=("kaiser", 5.0)) * _UP
+# 下采样（÷3）：同一套系数
+_H_DOWN = firwin(_N_TAPS, 1.0 / _UP, window=("kaiser", 5.0))
 
 
 def _load_rnnoise():
@@ -53,11 +60,11 @@ class RNNoiseFilter:
     输出：(降噪后 16kHz PCM16, 平均 VAD 概率 0~1)
 
     内部流程：
-      16kHz PCM16 → 升采样至 48kHz float32（soxr）→ RNNoise 逐帧处理
-      → 降采样回 16kHz（soxr）→ 输出 PCM16 + 平均 VAD 概率
+      16kHz PCM16 → 升采样至 48kHz float32 → RNNoise 逐帧处理
+      → 降采样回 16kHz → 输出 PCM16 + 平均 VAD 概率
 
-    优化：soxr（C 实现）替代 scipy upfirdn，重采样速度提升 5-10x；
-    reset() 只重建 C state，不重载模块。
+    优化：FIR 系数模块级预计算（进程内只算一次），upfirdn 替代 resample_poly，
+    消除每帧重算 FIR 的开销；reset() 只重建 C state，不重载模块。
     """
 
     def __init__(self) -> None:
@@ -77,8 +84,6 @@ class RNNoiseFilter:
         输入 16kHz PCM16 音频，返回 (降噪后 16kHz PCM16, 平均 VAD 概率)。
         帧不对齐时暂存余量，下次调用补齐。末尾不足一帧输出时延迟到下次。
         """
-        if isinstance(audio_bytes, np.ndarray):
-            audio_bytes = audio_bytes.astype(np.int16).tobytes()
         if not audio_bytes:
             return b"", 0.0
 
@@ -90,10 +95,8 @@ class RNNoiseFilter:
             else new_16k
         )
 
-        # 2. 升采样至 48kHz（soxr C 实现，比 scipy upfirdn 快 5-10x）
-        combined_48k_float = soxr.resample(
-            combined_16k.astype(np.float32), _ASR_RATE, _RNNOISE_RATE, quality="HQ"
-        )
+        # 2. 升采样至 48kHz（预计算 FIR，upfirdn 无重复初始化开销）
+        combined_48k_float = upfirdn(_H_UP, combined_16k.astype(np.float32), up=_UP, down=_DOWN)
         combined_48k = np.concatenate((self._remainder_48k, combined_48k_float))
 
         # 3. 逐帧处理（480 samples @ 48kHz = 10ms）
@@ -115,9 +118,9 @@ class RNNoiseFilter:
             self._remainder_16k = combined_16k
             return b"", 0.0
 
-        # 4. 降采样回 16kHz（soxr）
+        # 4. 降采样回 16kHz（预计算 FIR）
         out_48k = np.concatenate(out_frames_48k)
-        out_16k_float = soxr.resample(out_48k, _RNNOISE_RATE, _ASR_RATE, quality="HQ")
+        out_16k_float = upfirdn(_H_DOWN, out_48k, up=_DOWN, down=_UP)
         out_16k = np.clip(out_16k_float, -32768, 32767).astype(np.int16)
 
         # 5. 计算本批对应的 16kHz 余量
