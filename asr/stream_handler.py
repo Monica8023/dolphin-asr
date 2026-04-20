@@ -1,10 +1,13 @@
 import asyncio
 import logging
 import time
+from collections import deque
 from concurrent.futures import Executor
 from typing import Any
 
+import numpy as np
 import httpx
+from scipy.signal import firwin, upfirdn
 
 from asr.denoiser import RNNoiseFilter
 from asr.engine import ASREngine
@@ -13,6 +16,38 @@ from asr.vad import VADDetector
 from config import nacos_config as cfg
 
 logger = logging.getLogger(__name__)
+
+# 8kHz→16kHz 上采样 FIR 系数（模块级预计算，进程内只算一次）
+_UPSAMPLE_FACTOR = 2
+_UPSAMPLE_TAPS = 63
+_H_UPSAMPLE = firwin(_UPSAMPLE_TAPS, 1.0 / _UPSAMPLE_FACTOR, window=("kaiser", 5.0)) * _UPSAMPLE_FACTOR
+
+
+class _Resampler8kTo16k:
+    """8kHz PCM16 → 16kHz PCM16 上采样器，维护帧间余量避免边界伪影。"""
+
+    def __init__(self) -> None:
+        self._remainder = np.zeros(0, dtype=np.int16)
+
+    def process(self, audio_bytes: bytes) -> bytes:
+        new_samples = np.frombuffer(audio_bytes, dtype=np.int16)
+        combined = (
+            np.concatenate((self._remainder, new_samples))
+            if self._remainder.size
+            else new_samples
+        )
+        upsampled = upfirdn(_H_UPSAMPLE, combined.astype(np.float32), up=_UPSAMPLE_FACTOR, down=1)
+        out = np.clip(upsampled, -32768, 32767).astype(np.int16)
+        consumed_input = len(out) // _UPSAMPLE_FACTOR
+        self._remainder = (
+            combined[consumed_input:]
+            if consumed_input < combined.size
+            else np.zeros(0, dtype=np.int16)
+        )
+        return out.tobytes()
+
+    def reset(self) -> None:
+        self._remainder = np.zeros(0, dtype=np.int16)
 
 
 class StreamHandler:
@@ -31,13 +66,14 @@ class StreamHandler:
     - asr_executor: 专用线程池，高吞吐，供在线/离线 Paraformer 使用
     """
 
-    def __init__(self, call_id: int, uuid: int, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor):
+    def __init__(self, call_id: int, uuid: int, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor, offline_asr_executor: Executor | None = None):
         self.call_id = call_id
         self.uuid = uuid
         self.model_id = model_id
         self._http_client = http_client
         self._vad_executor = vad_executor
         self._asr_executor = asr_executor
+        self._offline_asr_executor = offline_asr_executor or asr_executor
 
         # 初始化时先用全局配置，start 事件后由 load_conf() 覆盖
         self._silence_max_ms: int = cfg.get("silence_max_ms", 800)
@@ -53,6 +89,7 @@ class StreamHandler:
         self._asr = ASREngine()
         self._offline_asr = OfflineASREngine()  # [新增] 实例化离线引擎
         self._denoiser = RNNoiseFilter()  # 每路连接独立实例，线程安全
+        self._resampler = _Resampler8kTo16k() if cfg.get("audio_input_sample_rate", 16000) != 16000 else None
         self._paused = True
 
         # 当前句子文本缓冲与音频缓冲
@@ -69,6 +106,9 @@ class StreamHandler:
         # 停顿检测状态
         self._in_speech: bool = False
         self._last_speech_end_ms: int | None = None
+
+        # VAD 前置回看缓冲：解决首字丢失（VAD 检测滞后导致语音起始帧未送 ASR）
+        self._audio_lookback: deque[bytes] = deque(maxlen=3)
 
         # 计时器
         self._no_answer_task: asyncio.Task | None = None
@@ -196,10 +236,11 @@ class StreamHandler:
     def _reset_sentence_state(self) -> None:
         """每句话处理完毕后调用，重置句子级状态，允许持续识别下一句。"""
         self._sentence_parts = []
-        self._sentence_audio_buffer.clear()  # [新增] 清空音频缓冲
+        self._sentence_audio_buffer.clear()
         self._in_speech = False
         self._last_speech_end_ms = None
         self._first_text_received = False
+        self._audio_lookback.clear()
         if self._match_timeout_task:
             self._match_timeout_task.cancel()
             self._match_timeout_task = None
@@ -224,7 +265,7 @@ class StreamHandler:
         # [新增] 如果缓冲区有残留音频，尝试用离线模型做最后一次高精度识别
         if self._sentence_audio_buffer:
             final_audio = bytes(self._sentence_audio_buffer)
-            offline_text = await loop.run_in_executor(self._asr_executor, self._offline_asr.transcribe, final_audio)
+            offline_text = await loop.run_in_executor(self._offline_asr_executor, self._offline_asr.transcribe, final_audio)
             if offline_text:
                 final_sentence = offline_text
 
@@ -245,13 +286,18 @@ class StreamHandler:
         loop = asyncio.get_running_loop()
         _t0 = time.monotonic()
 
-        # 0. RNNoise 降噪预处理（executor 中执行，不阻塞事件循环）
-        audio_bytes, _vad_prob = await loop.run_in_executor(
-            self._vad_executor, self._denoiser.process, audio_bytes
-        )
+        # 0a. 8kHz→16kHz 上采样（如需要）
+        if self._resampler is not None:
+            audio_bytes = self._resampler.process(audio_bytes)
+
+        raw_audio = audio_bytes
+
+        # 0b. RNNoise 降噪 + VAD 语音判定（并行执行）
+        denoise_future = loop.run_in_executor(self._vad_executor, self._denoiser.process, raw_audio)
+        vad_future = loop.run_in_executor(self._vad_executor, self._vad.is_speech, raw_audio)
+        (audio_bytes, _vad_prob), is_speech = await asyncio.gather(denoise_future, vad_future)
         _t1 = time.monotonic()
         if not audio_bytes:
-            # 余量未凑够一帧，等下一帧补齐，行为等价于静音帧
             return
 
         bytes_per_sample = 2  # 16-bit
@@ -274,9 +320,7 @@ class StreamHandler:
             end_ms,
         )
 
-        # 1. 单次 VAD 语音判定（后续打断与停顿逻辑复用）
-        is_speech = await loop.run_in_executor(self._vad_executor, self._vad.is_speech, audio_bytes)
-        _t2 = time.monotonic()
+        _t2 = _t1
         logger.debug("call_id=%s step1 is_speech=%s", self.call_id, is_speech)
 
         if is_speech or self._in_speech:
@@ -304,20 +348,23 @@ class StreamHandler:
         # 2. 流式 ASR 转写：音频帧必须完整送入以维持模型内部状态连续性
         text = ""
         if is_speech:
-            # 只有 VAD 判定这帧里有讲话声，才喂给在线 Paraformer。
+            if not self._in_speech and self._audio_lookback:
+                lookback_audio = b"".join(self._audio_lookback)
+                self._sentence_audio_buffer.extend(lookback_audio)
+                await loop.run_in_executor(self._asr_executor, self._asr.transcribe, lookback_audio)
+                self._audio_lookback.clear()
+                logger.debug("call_id=%s step2 lookback frames fed to ASR", self.call_id)
             logger.debug("call_id=%s step2 asr transcribe start (is_speech=True)", self.call_id)
             text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, audio_bytes)
         else:
-            # 纯噪音直接 Drop 掉，连推理都不做。
-            # 这能彻底杜绝 ASR 强行在底噪里找发音造成的"蹦出毫无关联的杂字"（幻觉）现象。
+            self._audio_lookback.append(audio_bytes)
             logger.debug("call_id=%s step2 asr transcribe skipped (noise dropped)", self.call_id)
         _t4 = time.monotonic()
 
         logger.debug(
-            "call_id=%s handle_audio timing: denoise=%dms vad=%dms interrupt=%dms asr=%dms total=%dms",
+            "call_id=%s handle_audio timing: denoise+vad=%dms interrupt=%dms asr=%dms total=%dms",
             self.call_id,
             int((_t1 - _t0) * 1000),
-            int((_t2 - _t1) * 1000),
             int((_t3 - _t2) * 1000),
             int((_t4 - _t3) * 1000),
             int((_t4 - _t0) * 1000),
@@ -368,7 +415,7 @@ class StreamHandler:
 
                     _offline_start = time.monotonic()
                     logger.info("call_id=%s step3 offline ASR start: audio_bytes=%d", self.call_id, len(sentence_audio))
-                    offline_sentence = await loop.run_in_executor(self._asr_executor, self._offline_asr.transcribe,
+                    offline_sentence = await loop.run_in_executor(self._offline_asr_executor, self._offline_asr.transcribe,
                                                                   sentence_audio)
                     _offline_ms = int((time.monotonic() - _offline_start) * 1000)
                     logger.info("call_id=%s step3 offline ASR done: cost=%dms result=%r", self.call_id, _offline_ms, offline_sentence)

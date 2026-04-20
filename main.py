@@ -22,14 +22,17 @@ logger = logging.getLogger(__name__)
 class _Executors(NamedTuple):
     vad: ThreadPoolExecutor
     asr: ThreadPoolExecutor
+    offline_asr: ThreadPoolExecutor
 
 
 def _build_executors() -> _Executors:
     vad_workers = int(os.environ.get("VAD_WORKERS", str(cfg.get("vad_workers", 4))))
-    asr_workers = int(os.environ.get("ASR_WORKERS", str(cfg.get("asr_workers", 8))))
+    asr_workers = int(os.environ.get("ASR_WORKERS", str(cfg.get("online_asr_workers", 4))))
+    offline_asr_workers = int(os.environ.get("OFFLINE_ASR_WORKERS", str(cfg.get("offline_asr_workers", 4))))
     return _Executors(
         vad=ThreadPoolExecutor(max_workers=vad_workers, thread_name_prefix="vad"),
         asr=ThreadPoolExecutor(max_workers=asr_workers, thread_name_prefix="asr"),
+        offline_asr=ThreadPoolExecutor(max_workers=offline_asr_workers, thread_name_prefix="offline-asr"),
     )
 
 
@@ -76,6 +79,7 @@ async def lifespan(app: FastAPI):
     await app.state.redis.aclose()
     _executors.vad.shutdown(wait=False)
     _executors.asr.shutdown(wait=False)
+    _executors.offline_asr.shutdown(wait=False)
     logger.info("dolphin-asr service stopped.")
 
 
@@ -180,6 +184,7 @@ async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0, model_id: in
         http_client=websocket.app.state.http_client,
         vad_executor=websocket.app.state.executor.vad,
         asr_executor=websocket.app.state.executor.asr,
+        offline_asr_executor=websocket.app.state.executor.offline_asr,
     )
     logger.info("WebSocket connected: call_id=%s", call_id)
     try:
