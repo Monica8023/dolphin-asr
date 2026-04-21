@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -19,6 +20,8 @@ from asr.stream_handler import StreamHandler
 
 logger = logging.getLogger(__name__)
 
+_AUDIO_QUEUE_SENTINEL = object()
+
 class _Executors(NamedTuple):
     vad: ThreadPoolExecutor
     asr: ThreadPoolExecutor
@@ -27,16 +30,13 @@ class _Executors(NamedTuple):
 
 def _build_executors() -> _Executors:
     vad_workers = int(os.environ.get("VAD_WORKERS", str(cfg.get("vad_workers", 4))))
-    asr_workers = int(os.environ.get("ASR_WORKERS", str(cfg.get("online_asr_workers", 4))))
-    offline_asr_workers = int(os.environ.get("OFFLINE_ASR_WORKERS", str(cfg.get("offline_asr_workers", 4))))
+    asr_workers = int(os.environ.get("ASR_WORKERS", str(cfg.get("online_asr_workers", cfg.get("asr_workers", 8)))))
+    offline_asr_workers = int(os.environ.get("OFFLINE_ASR_WORKERS", str(cfg.get("offline_asr_workers", cfg.get("asr_workers", 8)))))
     return _Executors(
         vad=ThreadPoolExecutor(max_workers=vad_workers, thread_name_prefix="vad"),
         asr=ThreadPoolExecutor(max_workers=asr_workers, thread_name_prefix="asr"),
         offline_asr=ThreadPoolExecutor(max_workers=offline_asr_workers, thread_name_prefix="offline-asr"),
     )
-
-
-_executors = _build_executors()
 
 
 class IntentTestRequest(BaseModel):
@@ -57,12 +57,14 @@ async def lifespan(app: FastAPI):
     load_vad_model()
     load_offline_model()
 
+    executors = _build_executors()
+
     # P0-fix-3: 全局 httpx 连接池，所有 StreamHandler 共用
     app.state.http_client = httpx.AsyncClient(
         limits=httpx.Limits(max_keepalive_connections=100, max_connections=500),
         timeout=httpx.Timeout(5.0),
     )
-    app.state.executor = _executors
+    app.state.executor = executors
 
     # Redis 客户端（per-call 配置从 Redis 拉取）
     app.state.redis = aioredis.from_url(
@@ -77,44 +79,13 @@ async def lifespan(app: FastAPI):
 
     await app.state.http_client.aclose()
     await app.state.redis.aclose()
-    _executors.vad.shutdown(wait=False)
-    _executors.asr.shutdown(wait=False)
-    _executors.offline_asr.shutdown(wait=False)
+    executors.vad.shutdown(wait=False)
+    executors.asr.shutdown(wait=False)
+    executors.offline_asr.shutdown(wait=False)
     logger.info("dolphin-asr service stopped.")
 
 
 app = FastAPI(title="dolphin-asr", lifespan=lifespan)
-
-
-@app.post("/test/intent")
-async def test_intent(req: IntentTestRequest) -> dict[str, Any]:
-    logger.info(f"Test intent {req.text} callId {req.call_id}")
-    if os.environ.get("TEST_INTENT_ENABLED", "false").lower() != "true":
-        raise HTTPException(status_code=404, detail="not found")
-
-
-    url = f"{cfg.get('intent_service_url')}/api/v1/recognize"
-    payload = {"text": req.text, "call_id": req.call_id}
-
-    preview = req.text if len(req.text) <= 100 else f"{req.text[:100]}..."
-    logger.info("intent test input: call_id=%s text=%r", req.call_id, preview)
-
-    try:
-        resp = await app.state.http_client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-    except httpx.TimeoutException as e:
-        logger.warning("intent test timeout: call_id=%s err=%s", req.call_id, e)
-        raise HTTPException(status_code=504, detail="intent service timeout") from e
-    except httpx.HTTPStatusError as e:
-        logger.warning("intent test http error: call_id=%s status=%s", req.call_id, e.response.status_code)
-        raise HTTPException(status_code=502, detail="intent service http error") from e
-    except httpx.HTTPError as e:
-        logger.warning("intent test request error: call_id=%s err=%s", req.call_id, e)
-        raise HTTPException(status_code=502, detail="intent service request error") from e
-
-    logger.info("intent test output: call_id=%s intent_id=%s", data.get("call_id"), data.get("intent_id", "intent_unknown"))
-    return {"request": payload, "response": data}
 
 
 async def _load_model_conf(redis_client: aioredis.Redis, model_id: int) -> dict:
@@ -130,7 +101,7 @@ async def _load_model_conf(redis_client: aioredis.Redis, model_id: int) -> dict:
     return {}
 
 
-async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: str, call_id: int) -> bool:
+async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: str, call_id: str) -> bool:
     """处理文本事件帧，返回是否需要结束 ws 循环。"""
     preview = raw if len(raw) <= 200 else f"{raw[:200]}..."
     logger.info(
@@ -174,8 +145,35 @@ async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: st
     return False
 
 
+def _drain_audio_queue(audio_queue: asyncio.Queue[bytes | object]) -> int:
+    drained = 0
+    while True:
+        try:
+            item = audio_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        if item is not _AUDIO_QUEUE_SENTINEL:
+            drained += 1
+        audio_queue.task_done()
+    return drained
+
+
+async def _audio_consumer_loop(handler: StreamHandler, audio_queue: asyncio.Queue[bytes | object], call_id: str) -> None:
+    while True:
+        item = await audio_queue.get()
+        try:
+            if item is _AUDIO_QUEUE_SENTINEL:
+                return
+            try:
+                await handler.handle_audio(item)
+            except Exception as e:
+                logger.error("call_id=%s audio consumer failed: %s", call_id, e)
+        finally:
+            audio_queue.task_done()
+
+
 @app.websocket("/ws/asr")
-async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0, model_id: int = 0):
+async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 0):
     await websocket.accept()
     handler = StreamHandler(
         call_id=call_id,
@@ -186,6 +184,12 @@ async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0, model_id: in
         asr_executor=websocket.app.state.executor.asr,
         offline_asr_executor=websocket.app.state.executor.offline_asr,
     )
+    queue_maxsize = int(cfg.get("audio_queue_maxsize", 64))
+    audio_queue: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=max(1, queue_maxsize))
+    consumer_task = asyncio.create_task(_audio_consumer_loop(handler, audio_queue, call_id))
+    dropped_frames = 0
+    stream_active = False
+
     logger.info("WebSocket connected: call_id=%s", call_id)
     try:
         while True:
@@ -199,15 +203,51 @@ async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0, model_id: in
                 break
 
             if text is not None:
-                # logger.info("call_id=%s routing ws text frame to event handler", call_id)
+                try:
+                    event = json.loads(text).get("control")
+                except ValueError:
+                    event = None
                 should_close = await _handle_ws_event(websocket, handler, text, call_id)
+                if event == "start":
+                    stream_active = True
+                elif event in {"pause", "stop"}:
+                    stream_active = False
+                if event in {"start", "pause", "stop"}:
+                    drained = _drain_audio_queue(audio_queue)
+                    if drained:
+                        logger.info(
+                            "call_id=%s audio queue drained after event=%s: dropped=%d",
+                            call_id,
+                            event,
+                            drained,
+                        )
                 if should_close:
                     break
                 continue
 
             if audio_bytes is not None:
-                # logger.info("call_id=%s routing ws binary frame to audio handler: bytes=%d", call_id, len(audio_bytes))
-                await handler.handle_audio(audio_bytes)
+                if not stream_active:
+                    continue
+                try:
+                    audio_queue.put_nowait(audio_bytes)
+                except asyncio.QueueFull:
+                    try:
+                        evicted = audio_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        evicted = None
+                    else:
+                        audio_queue.task_done()
+                    if evicted is _AUDIO_QUEUE_SENTINEL:
+                        audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
+                    audio_queue.put_nowait(audio_bytes)
+                    dropped_frames += 1
+                    if dropped_frames == 1 or dropped_frames % 20 == 0:
+                        logger.warning(
+                            "call_id=%s audio queue full: dropped_frames=%d queue_size=%d",
+                            call_id,
+                            dropped_frames,
+                            audio_queue.qsize(),
+                        )
                 continue
 
             logger.warning("call_id=%s ws message ignored: neither text nor bytes present", call_id)
@@ -216,4 +256,10 @@ async def ws_asr(websocket: WebSocket, call_id: int, uuid: int = 0, model_id: in
     except Exception as e:
         logger.error("WebSocket error call_id=%s: %s", call_id, e)
     finally:
+        try:
+            audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
+        except asyncio.QueueFull:
+            _drain_audio_queue(audio_queue)
+            audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
+        await consumer_task
         await handler.close()

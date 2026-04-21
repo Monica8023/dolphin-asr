@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 import httpx
-from scipy.signal import firwin, upfirdn
+from scipy.signal import resample_poly
 
 from asr.denoiser import RNNoiseFilter
 from asr.engine import ASREngine
@@ -17,37 +17,19 @@ from config import nacos_config as cfg
 
 logger = logging.getLogger(__name__)
 
-# 8kHz→16kHz 上采样 FIR 系数（模块级预计算，进程内只算一次）
-_UPSAMPLE_FACTOR = 2
-_UPSAMPLE_TAPS = 63
-_H_UPSAMPLE = firwin(_UPSAMPLE_TAPS, 1.0 / _UPSAMPLE_FACTOR, window=("kaiser", 5.0)) * _UPSAMPLE_FACTOR
-
 
 class _Resampler8kTo16k:
-    """8kHz PCM16 → 16kHz PCM16 上采样器，维护帧间余量避免边界伪影。"""
-
-    def __init__(self) -> None:
-        self._remainder = np.zeros(0, dtype=np.int16)
+    """8kHz PCM16 → 16kHz PCM16 上采样器。"""
 
     def process(self, audio_bytes: bytes) -> bytes:
-        new_samples = np.frombuffer(audio_bytes, dtype=np.int16)
-        combined = (
-            np.concatenate((self._remainder, new_samples))
-            if self._remainder.size
-            else new_samples
-        )
-        upsampled = upfirdn(_H_UPSAMPLE, combined.astype(np.float32), up=_UPSAMPLE_FACTOR, down=1)
-        out = np.clip(upsampled, -32768, 32767).astype(np.int16)
-        consumed_input = len(out) // _UPSAMPLE_FACTOR
-        self._remainder = (
-            combined[consumed_input:]
-            if consumed_input < combined.size
-            else np.zeros(0, dtype=np.int16)
-        )
-        return out.tobytes()
+        if not audio_bytes:
+            return b""
+        samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+        out = resample_poly(samples, up=2, down=1)
+        return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
 
     def reset(self) -> None:
-        self._remainder = np.zeros(0, dtype=np.int16)
+        return None
 
 
 class StreamHandler:
@@ -66,7 +48,7 @@ class StreamHandler:
     - asr_executor: 专用线程池，高吞吐，供在线/离线 Paraformer 使用
     """
 
-    def __init__(self, call_id: int, uuid: int, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor, offline_asr_executor: Executor | None = None):
+    def __init__(self, call_id: str, uuid: str, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor, offline_asr_executor: Executor | None = None):
         self.call_id = call_id
         self.uuid = uuid
         self.model_id = model_id
@@ -78,7 +60,7 @@ class StreamHandler:
         # 初始化时先用全局配置，start 事件后由 load_conf() 覆盖
         self._silence_max_ms: int = cfg.get("silence_max_ms", 800)
         self._no_answer_timeout_ms: int = cfg.get("no_answer_timeout_ms", 10000)
-        self._match_timeout_ms: int = 10000
+        self._match_timeout_ms: int = cfg.get("match_timeout_ms", 15000)
         self._interrupt_enabled: bool = cfg.get("interrupt_enabled", True)
         self._interrupt_threshold_ms: int = cfg.get("vad_interrupt_threshold_ms", 2000)
         self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
@@ -109,6 +91,8 @@ class StreamHandler:
 
         # VAD 前置回看缓冲：解决首字丢失（VAD 检测滞后导致语音起始帧未送 ASR）
         self._audio_lookback: deque[bytes] = deque(maxlen=3)
+        self._lookback_samples: int = 0
+        self._noise_speech_streak: int = 0
 
         # 计时器
         self._no_answer_task: asyncio.Task | None = None
@@ -160,6 +144,7 @@ class StreamHandler:
 
         self._silence_max_ms = call_conf.get("maxPauseTime") or self._silence_max_ms
         self._no_answer_timeout_ms = call_conf.get("noResponseTime") or self._no_answer_timeout_ms
+        self._match_timeout_ms = call_conf.get("matchTimeout") or self._match_timeout_ms
         if "enable" in interrupt_cfg:
             self._interrupt_enabled = interrupt_cfg["enable"]
         self._interrupt_threshold_ms = interrupt_cfg.get("interruptTime") or self._interrupt_threshold_ms
@@ -241,12 +226,14 @@ class StreamHandler:
         self._last_speech_end_ms = None
         self._first_text_received = False
         self._audio_lookback.clear()
+        self._lookback_samples = 0
+        self._noise_speech_streak = 0
         if self._match_timeout_task:
             self._match_timeout_task.cancel()
             self._match_timeout_task = None
         self._asr.reset()
         self._vad.reset()
-        self._denoiser.reset()  # 清空余量，防止句间串扰
+        self._denoiser.reset()
 
     async def close(self) -> None:
         """连接断开时调用：刷新模型内部缓冲区，处理最后一帧剩余文本。"""
@@ -295,7 +282,7 @@ class StreamHandler:
         # 0b. RNNoise 降噪 + VAD 语音判定（并行执行）
         denoise_future = loop.run_in_executor(self._vad_executor, self._denoiser.process, raw_audio)
         vad_future = loop.run_in_executor(self._vad_executor, self._vad.is_speech, raw_audio)
-        (audio_bytes, _vad_prob), is_speech = await asyncio.gather(denoise_future, vad_future)
+        (audio_bytes, rnnoise_vad_prob), is_speech = await asyncio.gather(denoise_future, vad_future)
         _t1 = time.monotonic()
         if not audio_bytes:
             return
@@ -304,12 +291,7 @@ class StreamHandler:
         num_samples = len(audio_bytes) // bytes_per_sample
         self._total_samples += num_samples
 
-        # chunk_ms = self._estimate_duration_ms(audio_bytes)
-        # end_ms = self._elapsed_ms + chunk_ms
-
         end_ms = int(self._total_samples / 16000 * 1000)
-
-        # 如果有些地方依然需要 chunk_ms
         chunk_ms = end_ms - self._elapsed_ms
         logger.debug(
             "call_id=%s handle_audio start: bytes=%d chunk_ms=%d elapsed_ms=%d end_ms=%d",
@@ -321,10 +303,13 @@ class StreamHandler:
         )
 
         _t2 = _t1
-        logger.debug("call_id=%s step1 is_speech=%s", self.call_id, is_speech)
+        logger.debug("call_id=%s step1 is_speech=%s rnnoise_vad_prob=%.3f", self.call_id, is_speech, rnnoise_vad_prob)
 
-        if is_speech or self._in_speech:
-            self._sentence_audio_buffer.extend(audio_bytes)
+        min_noise_vad_prob = cfg.get("noise_gate_rnnoise_vad_prob", 0.45)
+        min_noise_speech_frames = cfg.get("noise_gate_min_speech_frames", 2)
+        noise_gate_chars = set(cfg.get("noise_gate_filter_chars", ["嗯", "喂"]))
+        looks_like_noise = bool(is_speech and rnnoise_vad_prob < min_noise_vad_prob)
+        self._noise_speech_streak = self._noise_speech_streak + 1 if looks_like_noise else 0
 
         # 1.5 打断检测（基于 step1 的 is_speech，不重复跑 VAD）
         if self._interrupt_enabled:
@@ -353,25 +338,40 @@ class StreamHandler:
                 self._sentence_audio_buffer.extend(lookback_audio)
                 await loop.run_in_executor(self._asr_executor, self._asr.transcribe, lookback_audio)
                 self._audio_lookback.clear()
+                self._lookback_samples = 0
                 logger.debug("call_id=%s step2 lookback frames fed to ASR", self.call_id)
+            self._sentence_audio_buffer.extend(audio_bytes)
             logger.debug("call_id=%s step2 asr transcribe start (is_speech=True)", self.call_id)
             text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, audio_bytes)
+            if text and self._noise_speech_streak < min_noise_speech_frames and set(text) <= noise_gate_chars:
+                logger.info(
+                    "call_id=%s step2 noise-gate drop text=%r streak=%d rnnoise_vad_prob=%.3f",
+                    self.call_id,
+                    text,
+                    self._noise_speech_streak,
+                    rnnoise_vad_prob,
+                )
+                text = ""
         else:
             self._audio_lookback.append(audio_bytes)
+            self._lookback_samples += len(audio_bytes) // 2
+            max_lookback_ms = cfg.get("noise_gate_lookback_ms", 180)
+            max_lookback_samples = max_lookback_ms * 16
+            while self._lookback_samples > max_lookback_samples and self._audio_lookback:
+                removed = self._audio_lookback.popleft()
+                self._lookback_samples -= len(removed) // 2
             logger.debug("call_id=%s step2 asr transcribe skipped (noise dropped)", self.call_id)
         _t4 = time.monotonic()
 
-        logger.debug(
-            "call_id=%s handle_audio timing: denoise+vad=%dms interrupt=%dms asr=%dms total=%dms",
-            self.call_id,
-            int((_t1 - _t0) * 1000),
-            int((_t3 - _t2) * 1000),
-            int((_t4 - _t3) * 1000),
-            int((_t4 - _t0) * 1000),
-        )
-
-
         if text:
+            logger.info(
+                "call_id=%s handle_audio timing: denoise+vad=%dms interrupt=%dms asr=%dms total=%dms",
+                self.call_id,
+                int((_t1 - _t0) * 1000),
+                int((_t3 - _t2) * 1000),
+                int((_t4 - _t3) * 1000),
+                int((_t4 - _t0) * 1000),
+            )
             self._reset_no_answer_timer()
             logger.info("call_id=%s step2 no_answer timer reset", self.call_id)
             if not self._first_text_received:
@@ -401,7 +401,7 @@ class StreamHandler:
         else:
             if self._in_speech and self._last_speech_end_ms is not None:
                 silence_ms = end_ms - self._last_speech_end_ms
-                logger.debug(
+                logger.info(
                     "call_id=%s step3 silence check: silence_ms=%d threshold_ms=%d has_sentence_parts=%s",
                     self.call_id,
                     silence_ms,
@@ -432,8 +432,8 @@ class StreamHandler:
                     self._reset_sentence_state()
 
                     # [修改] 在原本的日志中额外增加 Online 和 Offline 的对比，方便 Debug 精度提升效果
-                    logger.info("call_id=%s step3 sentence done (silence %dms): %s (Online raw: %s)",
-                                self.call_id, silence_ms, sentence, online_sentence)
+                    logger.info("call_id=%s step3 sentence done (silence %dms  max_silence %dms): %s (Online raw: %s)",
+                                self.call_id, silence_ms, self._silence_max_ms, sentence, online_sentence)
                     logger.info("call_id=%s step3 intent task scheduled (epoch=%d)", self.call_id, sentence_epoch)
                     asyncio.create_task(self._send_transcript(sentence))
                     asyncio.create_task(self._call_intent(sentence, sentence_epoch))
@@ -488,7 +488,7 @@ class StreamHandler:
     async def _send_callback(self, intent_id: str, text: str) -> None:
         payload = {
             "call_id": self.call_id,
-            "event": "intent",
+            "event": "INTENT",
             "intent_id": intent_id,
             "uuid": self.uuid,
             "text": text,
@@ -508,7 +508,7 @@ class StreamHandler:
     async def _send_interrupt(self) -> None:
         payload = {
             "call_id": self.call_id,
-            "event": "interrupt",
+            "event": "INTERRUPT",
             "uuid": self.uuid,
         }
         await self._post(cfg.get("business_callback_url"), payload, "interrupt", timeout=3.0)
@@ -516,7 +516,7 @@ class StreamHandler:
     async def _send_no_answer(self) -> None:
         payload = {
             "call_id": self.call_id,
-            "event": "no_answer",
+            "event": "NOANSWER",
             "uuid": self.uuid,
         }
         await self._post(cfg.get("business_callback_url"), payload, "no_answer", timeout=3.0)
@@ -524,7 +524,7 @@ class StreamHandler:
     async def _send_fallback(self) -> None:
         payload = {
             "call_id": self.call_id,
-            "event": "match_timeout",
+            "event": "TIMEOUT",
             "uuid": self.uuid,
         }
         await self._post(cfg.get("business_callback_url"), payload, "match_timeout fallback", timeout=3.0)
