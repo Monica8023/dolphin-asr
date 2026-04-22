@@ -11,7 +11,6 @@ from scipy.signal import resample_poly
 
 from asr.denoiser import RNNoiseFilter
 from asr.engine import ASREngine
-from asr.offline_engine import OfflineASREngine  # [新增] 导入离线引擎
 from asr.vad import VADDetector
 from config import nacos_config as cfg
 
@@ -48,14 +47,13 @@ class StreamHandler:
     - asr_executor: 专用线程池，高吞吐，供在线/离线 Paraformer 使用
     """
 
-    def __init__(self, call_id: str, uuid: str, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor, offline_asr_executor: Executor | None = None):
+    def __init__(self, call_id: str, uuid: str, model_id: int, http_client: httpx.AsyncClient, vad_executor: Executor, asr_executor: Executor):
         self.call_id = call_id
         self.uuid = uuid
         self.model_id = model_id
         self._http_client = http_client
         self._vad_executor = vad_executor
         self._asr_executor = asr_executor
-        self._offline_asr_executor = offline_asr_executor or asr_executor
 
         # 初始化时先用全局配置，start 事件后由 load_conf() 覆盖
         self._silence_max_ms: int = cfg.get("silence_max_ms", 800)
@@ -69,14 +67,12 @@ class StreamHandler:
 
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         self._asr = ASREngine()
-        self._offline_asr = OfflineASREngine()  # [新增] 实例化离线引擎
         self._denoiser = RNNoiseFilter()  # 每路连接独立实例，线程安全
         self._resampler = _Resampler8kTo16k() if cfg.get("audio_input_sample_rate", 16000) != 16000 else None
         self._paused = True
 
-        # 当前句子文本缓冲与音频缓冲
+        # 当前句子文本缓冲
         self._sentence_parts: list[str] = []
-        self._sentence_audio_buffer = bytearray()  # [新增] 缓冲当前整句的音频
         self._sentence_start_ms: int = 0
         self._sentence_epoch: int = 0
 
@@ -221,7 +217,6 @@ class StreamHandler:
     def _reset_sentence_state(self) -> None:
         """每句话处理完毕后调用，重置句子级状态，允许持续识别下一句。"""
         self._sentence_parts = []
-        self._sentence_audio_buffer.clear()
         self._in_speech = False
         self._last_speech_end_ms = None
         self._first_text_received = False
@@ -242,25 +237,12 @@ class StreamHandler:
             return
         loop = asyncio.get_running_loop()
 
-        # [修改] 获取流式模型最后的 flush
         text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, b"", True)
         if text:
             self._sentence_parts.append(text)
 
-        final_sentence = ""
-
-        # [新增] 如果缓冲区有残留音频，尝试用离线模型做最后一次高精度识别
-        if self._sentence_audio_buffer:
-            final_audio = bytes(self._sentence_audio_buffer)
-            offline_text = await loop.run_in_executor(self._offline_asr_executor, self._offline_asr.transcribe, final_audio)
-            if offline_text:
-                final_sentence = offline_text
-
-        # 降级：如果离线没结果，用在线模型拼凑的文本
-        if not final_sentence and self._sentence_parts:
+        if self._sentence_parts:
             final_sentence = "".join(self._sentence_parts)
-
-        if final_sentence:
             self._sentence_parts = []
             logger.info("call_id=%s final flush: %s", self.call_id, final_sentence)
             await self._call_intent(final_sentence)
@@ -335,12 +317,10 @@ class StreamHandler:
         if is_speech:
             if not self._in_speech and self._audio_lookback:
                 lookback_audio = b"".join(self._audio_lookback)
-                self._sentence_audio_buffer.extend(lookback_audio)
                 await loop.run_in_executor(self._asr_executor, self._asr.transcribe, lookback_audio)
                 self._audio_lookback.clear()
                 self._lookback_samples = 0
                 logger.debug("call_id=%s step2 lookback frames fed to ASR", self.call_id)
-            self._sentence_audio_buffer.extend(audio_bytes)
             logger.debug("call_id=%s step2 asr transcribe start (is_speech=True)", self.call_id)
             text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, audio_bytes)
             if text and self._noise_speech_streak < min_noise_speech_frames and set(text) <= noise_gate_chars:
@@ -409,19 +389,7 @@ class StreamHandler:
                     bool(self._sentence_parts),
                 )
                 if silence_ms >= self._silence_max_ms and self._sentence_parts:
-                    # [修改] 提取原始流式识别的句子，并同时提取音频送入离线模型纠错
-                    online_sentence = "".join(self._sentence_parts)
-                    sentence_audio = bytes(self._sentence_audio_buffer)
-
-                    _offline_start = time.monotonic()
-                    logger.info("call_id=%s step3 offline ASR start: audio_bytes=%d", self.call_id, len(sentence_audio))
-                    offline_sentence = await loop.run_in_executor(self._offline_asr_executor, self._offline_asr.transcribe,
-                                                                  sentence_audio)
-                    _offline_ms = int((time.monotonic() - _offline_start) * 1000)
-                    logger.info("call_id=%s step3 offline ASR done: cost=%dms result=%r", self.call_id, _offline_ms, offline_sentence)
-
-                    # 如果离线模型吐出了有效文本，则覆盖；否则降级保留原本的在线结果
-                    sentence = offline_sentence if offline_sentence else online_sentence
+                    sentence = "".join(self._sentence_parts)
 
                     self._sentence_parts = []
                     self._sentence_start_ms = end_ms
@@ -431,9 +399,8 @@ class StreamHandler:
                     sentence_epoch = self._sentence_epoch
                     self._reset_sentence_state()
 
-                    # [修改] 在原本的日志中额外增加 Online 和 Offline 的对比，方便 Debug 精度提升效果
-                    logger.info("call_id=%s step3 sentence done (silence %dms  max_silence %dms): %s (Online raw: %s)",
-                                self.call_id, silence_ms, self._silence_max_ms, sentence, online_sentence)
+                    logger.info("call_id=%s step3 sentence done (silence %dms  max_silence %dms): %s",
+                                self.call_id, silence_ms, self._silence_max_ms, sentence)
                     logger.info("call_id=%s step3 intent task scheduled (epoch=%d)", self.call_id, sentence_epoch)
                     asyncio.create_task(self._send_transcript(sentence))
                     asyncio.create_task(self._call_intent(sentence, sentence_epoch))

@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
     await cfg.init_config(
         nacos_server=os.environ.get("NACOS_SERVER", "nacos.register.service.com:8848"),
         nacos_namespace=os.environ.get("NACOS_NAMESPACE", "asr_test"),
-        nacos_data_id=os.environ.get("NACOS_DATA_ID", "asr-server-test.yaml"),
+        nacos_data_id=os.environ.get("NACOS_DATA_ID", "asr-server.yaml"),
         nacos_group=os.environ.get("NACOS_GROUP", "dolphin"),
     )
     load_model()
@@ -182,7 +182,6 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
         http_client=websocket.app.state.http_client,
         vad_executor=websocket.app.state.executor.vad,
         asr_executor=websocket.app.state.executor.asr,
-        offline_asr_executor=websocket.app.state.executor.offline_asr,
     )
     queue_maxsize = int(cfg.get("audio_queue_maxsize", 64))
     audio_queue: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=max(1, queue_maxsize))

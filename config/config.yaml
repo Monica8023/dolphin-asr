@@ -9,7 +9,8 @@ vad_interrupt_threshold_ms: 2000
 interrupt_enabled: true
 
 # 停顿最大时长：静音超过此时长判定一句话结束，触发 Intent 调用
-silence_max_ms: 600
+# 从 600ms 降至 450ms，固定减少 ~150ms 句尾等待延迟；灰度压测后可继续下调至 350ms
+silence_max_ms: 450
 
 # 客户无应答时长：连接后超过此时长未收到有效文本，推送无应答指令
 no_answer_timeout_ms: 10000
@@ -23,19 +24,36 @@ log_level: "INFO"
 # FunASR 模型配置（路径通过此处配置，支持 Nacos 热更新）
 asr_model_path: "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
 vad_model_path: "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-enhancer_model_path: "D:/model/iic/speech_zipenhancer_ans_multiloss_16k_base"
 offline_asr_model_path: "D:/model/iic/funasr_finetune_offline"
 asr_device: "cpu"
 # 流式推理分块参数：[lookback, current, lookahead]（单位：LFR 帧，1帧≈60ms）
-# current=2 → chunk_stride=120ms，首词延迟从 ~480ms 降至 ~240ms；look_back 增大补偿精度
+# current=2 → chunk_stride=960 samples=60ms，首词延迟从 ~240ms 降至 ~120ms
 asr_chunk_size: [0, 2, 1]
-asr_encoder_chunk_look_back: 4
+asr_encoder_chunk_look_back: 7
 asr_decoder_chunk_look_back: 1
 intent_epoch_guard_enabled: true
 asr_workers: 8
 vad_workers: 4
 enhancer_workers: 2
-vad_energy_threshold: 500
+# RNNoise + VAD 的轻量噪声门限：连续弱语音帧且仅识别出“嗯/喂”等短拟声词时丢弃
+noise_gate_rnnoise_vad_prob: 0.45
+noise_gate_min_speech_frames: 2
+noise_gate_lookback_ms: 180
+noise_gate_filter_chars: ["嗯", "喂"]
+# 流式 ASR 专用线程池（从 asr_workers 中分离，避免 offline 重任务挤占在线分块推理）
+online_asr_workers: 4
+# 离线 ASR 专用线程池（整句重任务，独立不影响流式 ASR 时延）
+offline_asr_workers: 4
+# enhancer 缓冲阈值（samples @ 16kHz）：从 3200(200ms) 降至 1600(100ms)，降低首字前置等待
+# 灰度验证无质量下降后可继续降至 800(50ms)
+enhancer_buffer_samples: 1600
+
+# 每路连接的音频收包队列长度（帧数），用于“收包与在线ASR异步解耦”
+audio_queue_maxsize: 64
 
 # VAD 门控 ASR：VAD 判为非语音的帧不送入 ASR，从根本上拦截噪音识别（true=开启）
 vad_gate_asr: false
+
+# 输入音频采样率（Hz）：8000=正式环境 8kHz，16000=测试环境 16kHz
+# 非 16000 时自动上采样到 16kHz 再送入各模型；已是 16kHz 则直接透传
+audio_input_sample_rate: 8000

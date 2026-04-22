@@ -1,115 +1,105 @@
-"""ASR engine — FunASR ParaformerStreaming (online ONNX) integration."""
+"""ASR engine — sherpa-onnx streaming Zipformer (Transducer) integration."""
 import logging
 
 import numpy as np
+import sherpa_onnx
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 logger = logging.getLogger(__name__)
 
-_model = None
+_recognizer: sherpa_onnx.OnlineRecognizer | None = None
 
 
 def load_model() -> None:
-    """启动时加载一次全局 ASR 模型，所有连接共享同一模型实例（线程安全只读）。"""
-    global _model
-    import funasr.models.paraformer_streaming.model  # noqa: F401 — 确保 ParaformerStreaming 注册到 tables
-    from funasr import AutoModel
+    """启动时加载一次全局 OnlineRecognizer，所有连接共享（只读，线程安全）。"""
+    global _recognizer
     from config import nacos_config as cfg
 
-    model_path = cfg.get("asr_model_path")
-    device = cfg.get("asr_device", "cpu")
-    logger.info("Loading ASR model from %s on device=%s", model_path, device)
-    _model = AutoModel(model=model_path, device=device, disable_update=True)
-    logger.info("ASR model loaded.")
+    model_dir = cfg.get("asr_model_path")
+    #fp16
+    # encoder = cfg.get("asr_encoder", f"{model_dir}/encoder.fp16.onnx")
+    # decoder = cfg.get("asr_decoder", f"{model_dir}/decoder.fp16.onnx")
+    # joiner = cfg.get("asr_joiner", f"{model_dir}/joiner.fp16.onnx")
+
+    #int8
+    encoder = cfg.get("asr_encoder", f"{model_dir}/encoder.int8.onnx")
+    decoder = cfg.get("asr_decoder", f"{model_dir}/decoder.onnx")
+    joiner = cfg.get("asr_joiner", f"{model_dir}/joiner.int8.onnx")
+    BPE_VOCAB = f"{model_dir}/bpe.vocab"
+    tokens = cfg.get("asr_tokens", f"{model_dir}/tokens.txt")
+    num_threads = cfg.get("asr_num_threads", 2)
+    feature_dim = cfg.get("asr_feature_dim", 80)
+    provider = cfg.get("asr_provider", "cuda")
+
+    logger.info(
+        "Loading Zipformer model: encoder=%s decoder=%s joiner=%s tokens=%s "
+        "num_threads=%d feature_dim=%d provider=%s",
+        encoder, decoder, joiner, tokens, num_threads, feature_dim, provider,
+    )
+    _recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+        tokens=tokens,
+        encoder=encoder,
+        decoder=decoder,
+        joiner=joiner,
+        num_threads=num_threads,
+        sample_rate=16000,
+        feature_dim=feature_dim,
+        provider=provider,
+
+        # decoding_method="modified_beam_search",
+        # hotwords_file="/home/zhulieai/xwl/ASR/asr/hotword.txt",
+        # hotwords_score=1.5,
+
+        # modeling_unit="cjkchar+bpe",
+        # bpe_vocab=BPE_VOCAB
+    )
+    logger.info("Zipformer model loaded.")
 
 
 class ASREngine:
-    """每路 WebSocket 连接独立一个实例，持有流式推理所需的 cache 状态。"""
+    """每路 WebSocket 连接独立一个实例，持有 OnlineStream 流式解码状态。"""
 
     def __init__(self) -> None:
-        self._cache: dict = {}
-        self._audio_buffer = np.zeros(0, dtype=np.float32)
+        self._stream: sherpa_onnx.OnlineStream | None = None
+        self._last_text: str = ""
+        if _recognizer is not None:
+            self._stream = _recognizer.create_stream()
 
     def transcribe(self, audio_bytes: bytes, is_final: bool = False) -> str:
         """
-        喂入一帧 PCM16 音频，返回当前帧的识别文本（可能为空）。
+        喂入一帧 PCM16 音频，返回本次新增的识别文本（可能为空）。
 
         audio_bytes: 16kHz, 16-bit PCM, mono, little-endian
-        is_final: 连接断开时传 True，刷新模型内部缓冲区
+        is_final: 连接断开时传 True，取出剩余缓冲文本后重置流
         """
-        if _model is None:
+        if _recognizer is None or self._stream is None:
             return ""
         if not audio_bytes and not is_final:
             return ""
 
-        from config import nacos_config as cfg
-
         if audio_bytes:
-            # 输入已为 16kHz PCM16（由 stream_handler 入口统一上采样），直接归一化
-            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        else:
-            audio_np = np.zeros(0, dtype=np.float32)
+            samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            self._stream.accept_waveform(16000, samples)
 
-        if audio_np.size:
-            self._audio_buffer = np.concatenate((self._audio_buffer, audio_np))
+        while _recognizer.is_ready(self._stream):
+            _recognizer.decode_stream(self._stream)
 
-        chunk_size = cfg.get("asr_chunk_size", [0, 10, 5])
-        encoder_look_back = cfg.get("asr_encoder_chunk_look_back", 4)
-        decoder_look_back = cfg.get("asr_decoder_chunk_look_back", 1)
+        current_text: str = _recognizer.get_result(self._stream)
 
-        current_chunk = chunk_size[1] if isinstance(chunk_size, (list, tuple)) and len(chunk_size) > 1 else 10
-        chunk_stride = max(1, int(current_chunk)) * 480
-
-        texts: list[str] = []
-
-        while self._audio_buffer.size >= chunk_stride:
-            chunk = self._audio_buffer[:chunk_stride]
-            self._audio_buffer = self._audio_buffer[chunk_stride:]
-            result = _model.generate(
-                input=chunk,
-                cache=self._cache,
-                is_final=False,
-                chunk_size=chunk_size,
-                encoder_chunk_look_back=encoder_look_back,
-                decoder_chunk_look_back=decoder_look_back,
-                disable_pbar=True,
-            )
-            if result and result[0].get("text"):
-                text = result[0]["text"].strip()
-                if text:
-                    score = result[0].get("score", result[0].get("am_score", None))
-                    logger.debug("asr chunk text=%r score=%s result_keys=%s", text, score, list(result[0].keys()))
-                    confidence_threshold = cfg.get("asr_confidence_threshold", -999.0)
-                    if score is not None and confidence_threshold > -999.0 and score < confidence_threshold:
-                        logger.info("asr chunk low confidence score=%.3f < threshold=%.3f, drop: %r", score, confidence_threshold, text)
-                        continue
-                    texts.append(text)
+        # get_result 返回自上次 reset 以来的累计文本，取增量部分返回
+        new_text = current_text[len(self._last_text):]
+        self._last_text = current_text
 
         if is_final:
-            final_chunk = self._audio_buffer
-            self._audio_buffer = np.zeros(0, dtype=np.float32)
-            result = _model.generate(
-                input=final_chunk,
-                cache=self._cache,
-                is_final=True,
-                chunk_size=chunk_size,
-                encoder_chunk_look_back=encoder_look_back,
-                decoder_chunk_look_back=decoder_look_back,
-                disable_pbar=True,
-            )
-            if result and result[0].get("text"):
-                text = result[0]["text"].strip()
-                if text:
-                    score = result[0].get("score", result[0].get("am_score", None))
-                    logger.debug("asr final text=%r score=%s", text, score)
-                    confidence_threshold = cfg.get("asr_confidence_threshold", -999.0)
-                    if score is not None and confidence_threshold > -999.0 and score < confidence_threshold:
-                        logger.info("asr final low confidence score=%.3f < threshold=%.3f, drop: %r", score, confidence_threshold, text)
-                    else:
-                        texts.append(text)
+            self._last_text = ""
+            _recognizer.reset(self._stream)
 
-        return "".join(texts)
+        return new_text
 
     def reset(self) -> None:
-        """重置流式状态（通话结束或重新开始时调用）。"""
-        self._cache = {}
-        self._audio_buffer = np.zeros(0, dtype=np.float32)
+        """每句话结束后调用，重置流式解码状态准备识别下一句。"""
+        if _recognizer is not None and self._stream is not None:
+            _recognizer.reset(self._stream)
+        self._last_text = ""
