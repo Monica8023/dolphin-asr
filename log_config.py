@@ -1,11 +1,17 @@
 import logging
 import logging.handlers
 import os
+import queue
 
 from config import nacos_config as cfg
 
 
+_LOG_QUEUE: queue.Queue | None = None
+_QUEUE_LISTENER: logging.handlers.QueueListener | None = None
+
+
 def setup_logging() -> None:
+    global _LOG_QUEUE, _QUEUE_LISTENER
     log_path = cfg.get("log_path", "./log")
     log_level = cfg.get("log_level", "INFO")
     os.makedirs(log_path, exist_ok=True)
@@ -25,12 +31,18 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
-    # 避免重复添加（热重载场景）
-    if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in root.handlers):
-        root.addHandler(file_handler)
-    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in root.handlers):
-        root.addHandler(console_handler)
+    for handler in list(root.handlers):
+        if isinstance(handler, (logging.handlers.RotatingFileHandler, logging.StreamHandler)) and not isinstance(handler, logging.handlers.QueueHandler):
+            root.removeHandler(handler)
 
-    # 屏蔽第三方库（FunASR / ModelScope）的内部日志，只保留 WARNING 及以上
+    if _LOG_QUEUE is None:
+        _LOG_QUEUE = queue.Queue(-1)
+    if _QUEUE_LISTENER is None:
+        _QUEUE_LISTENER = logging.handlers.QueueListener(_LOG_QUEUE, file_handler, console_handler)
+        _QUEUE_LISTENER.start()
+
+    if not any(isinstance(h, logging.handlers.QueueHandler) for h in root.handlers):
+        root.addHandler(logging.handlers.QueueHandler(_LOG_QUEUE))
+
     for noisy_logger in ("funasr", "modelscope", "modelscope.pipelines"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)

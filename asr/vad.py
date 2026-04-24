@@ -30,13 +30,16 @@ class VADDetector:
         self._speech_start: float | None = None
         self._interrupted = False
         self._vad_cache: dict = {}
-        # 新增：维护当前的语音活动状态
         self._is_speaking = False
+        self._chunk_ms: int | None = None
+        self._cache_frame_count: int = 0
+        self._cache_reset_interval_frames: int = 6000
 
     def reset(self) -> None:
         self._speech_start = None
         self._interrupted = False
         self._vad_cache = {}
+        self._cache_frame_count = 0
 
     def is_speech(self, audio_bytes: bytes) -> bool:
         """解析 FunASR 输出事件，更新 _is_speaking 状态"""
@@ -45,7 +48,9 @@ class VADDetector:
 
         if _vad_model is not None:
             audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            chunk_ms = max(1, len(audio_np) // 16)
+            if self._chunk_ms is None:
+                self._chunk_ms = max(1, len(audio_np) // 16)
+            chunk_ms = self._chunk_ms
             try:
                 result = _vad_model.generate(
                     input=audio_np,
@@ -54,6 +59,10 @@ class VADDetector:
                     chunk_size=chunk_ms,
                     disable_pbar=True,
                 )
+                self._cache_frame_count += 1
+                if self._cache_frame_count >= self._cache_reset_interval_frames:
+                    self._vad_cache = {}
+                    self._cache_frame_count = 0
 
                 # 解析 FSMN-VAD 的事件流
                 if result and "value" in result[0]:

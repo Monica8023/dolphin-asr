@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, NamedTuple
 
 import httpx
@@ -55,7 +55,6 @@ async def lifespan(app: FastAPI):
     )
     load_model()
     load_vad_model()
-    load_offline_model()
 
     executors = _build_executors()
 
@@ -145,20 +144,16 @@ async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: st
     return False
 
 
-def _drain_audio_queue(audio_queue: asyncio.Queue[bytes | object]) -> int:
-    drained = 0
+async def _drain_audio_queue(audio_queue: asyncio.Queue[bytes | object]) -> None:
     while True:
         try:
-            item = audio_queue.get_nowait()
+            audio_queue.get_nowait()
+            audio_queue.task_done()
         except asyncio.QueueEmpty:
-            break
-        if item is not _AUDIO_QUEUE_SENTINEL:
-            drained += 1
-        audio_queue.task_done()
-    return drained
+            return
 
 
-async def _audio_consumer_loop(handler: StreamHandler, audio_queue: asyncio.Queue[bytes | object], call_id: str) -> None:
+async def _audio_consumer_loop(handler: StreamHandler, audio_queue: asyncio.Queue[bytes | object]) -> None:
     while True:
         item = await audio_queue.get()
         try:
@@ -167,9 +162,28 @@ async def _audio_consumer_loop(handler: StreamHandler, audio_queue: asyncio.Queu
             try:
                 await handler.handle_audio(item)
             except Exception as e:
-                logger.error("call_id=%s audio consumer failed: %s", call_id, e)
+                logger.error("Audio consumer frame handling failed: %s", e, exc_info=True)
         finally:
             audio_queue.task_done()
+
+
+def _enqueue_sentinel(audio_queue: asyncio.Queue[bytes | object]) -> None:
+    try:
+        audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
+        return
+    except asyncio.QueueFull:
+        pass
+
+    try:
+        audio_queue.get_nowait()
+        audio_queue.task_done()
+    except asyncio.QueueEmpty:
+        return
+
+    try:
+        audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
+    except asyncio.QueueFull:
+        logger.warning("Failed to enqueue audio queue sentinel: queue still full")
 
 
 @app.websocket("/ws/asr")
@@ -183,10 +197,9 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
         vad_executor=websocket.app.state.executor.vad,
         asr_executor=websocket.app.state.executor.asr,
     )
-    queue_maxsize = int(cfg.get("audio_queue_maxsize", 64))
-    audio_queue: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=max(1, queue_maxsize))
-    consumer_task = asyncio.create_task(_audio_consumer_loop(handler, audio_queue, call_id))
-    dropped_frames = 0
+    queue_maxsize = max(1, int(cfg.get("audio_queue_maxsize", 64)))
+    audio_queue: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=queue_maxsize)
+    consumer_task = asyncio.create_task(_audio_consumer_loop(handler, audio_queue))
     stream_active = False
 
     logger.info("WebSocket connected: call_id=%s", call_id)
@@ -206,20 +219,16 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                     event = json.loads(text).get("control")
                 except ValueError:
                     event = None
+
                 should_close = await _handle_ws_event(websocket, handler, text, call_id)
+
                 if event == "start":
                     stream_active = True
+                    await _drain_audio_queue(audio_queue)
                 elif event in {"pause", "stop"}:
                     stream_active = False
-                if event in {"start", "pause", "stop"}:
-                    drained = _drain_audio_queue(audio_queue)
-                    if drained:
-                        logger.info(
-                            "call_id=%s audio queue drained after event=%s: dropped=%d",
-                            call_id,
-                            event,
-                            drained,
-                        )
+                    await _drain_audio_queue(audio_queue)
+
                 if should_close:
                     break
                 continue
@@ -231,22 +240,16 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                     audio_queue.put_nowait(audio_bytes)
                 except asyncio.QueueFull:
                     try:
-                        evicted = audio_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        evicted = None
-                    else:
+                        dropped = audio_queue.get_nowait()
                         audio_queue.task_done()
-                    if evicted is _AUDIO_QUEUE_SENTINEL:
-                        audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
-                    audio_queue.put_nowait(audio_bytes)
-                    dropped_frames += 1
-                    if dropped_frames == 1 or dropped_frames % 20 == 0:
-                        logger.warning(
-                            "call_id=%s audio queue full: dropped_frames=%d queue_size=%d",
-                            call_id,
-                            dropped_frames,
-                            audio_queue.qsize(),
-                        )
+                        if dropped is _AUDIO_QUEUE_SENTINEL:
+                            await audio_queue.put(_AUDIO_QUEUE_SENTINEL)
+                    except asyncio.QueueEmpty:
+                        pass
+                    try:
+                        audio_queue.put_nowait(audio_bytes)
+                    except asyncio.QueueFull:
+                        logger.debug("call_id=%s audio frame dropped due to full queue", call_id)
                 continue
 
             logger.warning("call_id=%s ws message ignored: neither text nor bytes present", call_id)
@@ -255,10 +258,12 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
     except Exception as e:
         logger.error("WebSocket error call_id=%s: %s", call_id, e)
     finally:
+        _enqueue_sentinel(audio_queue)
         try:
-            audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
-        except asyncio.QueueFull:
-            _drain_audio_queue(audio_queue)
-            audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
-        await consumer_task
+            await asyncio.wait_for(consumer_task, timeout=3.0)
+        except asyncio.TimeoutError:
+            consumer_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await consumer_task
+            logger.warning("call_id=%s audio consumer did not exit in time, cancelled", call_id)
         await handler.close()

@@ -3,11 +3,11 @@ import logging
 import time
 from collections import deque
 from concurrent.futures import Executor
-from typing import Any
+from typing import Any, Awaitable
 
 import numpy as np
 import httpx
-from scipy.signal import resample_poly
+from scipy.signal import firwin, resample_poly
 
 from asr.denoiser import RNNoiseFilter
 from asr.engine import ASREngine
@@ -18,13 +18,17 @@ logger = logging.getLogger(__name__)
 
 
 class _Resampler8kTo16k:
-    """8kHz PCM16 → 16kHz PCM16 上采样器。"""
+    """8kHz PCM16 → 16kHz PCM16 上采样器（预计算 FIR，避免每帧重算系数）。"""
+
+    _up = 2
+    _down = 1
+    _h = firwin(63, 1.0 / _up, window=("kaiser", 5.0)) * _up
 
     def process(self, audio_bytes: bytes) -> bytes:
         if not audio_bytes:
             return b""
         samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-        out = resample_poly(samples, up=2, down=1)
+        out = resample_poly(samples, up=self._up, down=self._down, window=self._h)
         return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
 
     def reset(self) -> None:
@@ -61,6 +65,10 @@ class StreamHandler:
         self._match_timeout_ms: int = cfg.get("match_timeout_ms", 15000)
         self._interrupt_enabled: bool = cfg.get("interrupt_enabled", True)
         self._interrupt_threshold_ms: int = cfg.get("vad_interrupt_threshold_ms", 2000)
+        self._noise_gate_rnnoise_vad_prob: float = cfg.get("noise_gate_rnnoise_vad_prob", 0.45)
+        self._noise_gate_min_speech_frames: int = cfg.get("noise_gate_min_speech_frames", 2)
+        self._noise_gate_filter_chars: set[str] = set(cfg.get("noise_gate_filter_chars", ["嗯", "喂"]))
+        self._noise_gate_lookback_ms: int = cfg.get("noise_gate_lookback_ms", 180)
         self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
         self._word_count: int = 2
         self._question_similarity: float | None = None
@@ -204,6 +212,55 @@ class StreamHandler:
 
         self._question_similarity = normalized_similarity
 
+        noise_gate_vad_prob = call_conf.get("noiseGateRnnoiseVadProb")
+        if noise_gate_vad_prob is not None:
+            try:
+                parsed_prob = float(noise_gate_vad_prob)
+                if parsed_prob >= 0:
+                    self._noise_gate_rnnoise_vad_prob = parsed_prob
+            except (TypeError, ValueError):
+                logger.warning(
+                    "call_id=%s model_id=%s invalid noiseGateRnnoiseVadProb=%r, keep previous=%s",
+                    self.call_id,
+                    self.model_id,
+                    noise_gate_vad_prob,
+                    self._noise_gate_rnnoise_vad_prob,
+                )
+
+        noise_gate_min_frames = call_conf.get("noiseGateMinSpeechFrames")
+        if noise_gate_min_frames is not None:
+            try:
+                parsed_frames = int(noise_gate_min_frames)
+                if parsed_frames >= 1:
+                    self._noise_gate_min_speech_frames = parsed_frames
+            except (TypeError, ValueError):
+                logger.warning(
+                    "call_id=%s model_id=%s invalid noiseGateMinSpeechFrames=%r, keep previous=%s",
+                    self.call_id,
+                    self.model_id,
+                    noise_gate_min_frames,
+                    self._noise_gate_min_speech_frames,
+                )
+
+        noise_gate_lookback_ms = call_conf.get("noiseGateLookbackMs")
+        if noise_gate_lookback_ms is not None:
+            try:
+                parsed_lookback_ms = int(noise_gate_lookback_ms)
+                if parsed_lookback_ms >= 0:
+                    self._noise_gate_lookback_ms = parsed_lookback_ms
+            except (TypeError, ValueError):
+                logger.warning(
+                    "call_id=%s model_id=%s invalid noiseGateLookbackMs=%r, keep previous=%s",
+                    self.call_id,
+                    self.model_id,
+                    noise_gate_lookback_ms,
+                    self._noise_gate_lookback_ms,
+                )
+
+        noise_gate_chars = call_conf.get("noiseGateFilterChars")
+        if isinstance(noise_gate_chars, list) and noise_gate_chars:
+            self._noise_gate_filter_chars = set(noise_gate_chars)
+
 
         self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
         logger.info(
@@ -255,11 +312,11 @@ class StreamHandler:
         loop = asyncio.get_running_loop()
         _t0 = time.monotonic()
 
-        # 0a. 8kHz→16kHz 上采样（如需要）
+        # 0a. 8kHz→16kHz 上采样（如需要，放入 executor 避免阻塞事件循环）
         if self._resampler is not None:
-            audio_bytes = self._resampler.process(audio_bytes)
-
-        raw_audio = audio_bytes
+            raw_audio = await loop.run_in_executor(self._vad_executor, self._resampler.process, audio_bytes)
+        else:
+            raw_audio = audio_bytes
 
         # 0b. RNNoise 降噪 + VAD 语音判定（并行执行）
         denoise_future = loop.run_in_executor(self._vad_executor, self._denoiser.process, raw_audio)
@@ -287,9 +344,9 @@ class StreamHandler:
         _t2 = _t1
         logger.debug("call_id=%s step1 is_speech=%s rnnoise_vad_prob=%.3f", self.call_id, is_speech, rnnoise_vad_prob)
 
-        min_noise_vad_prob = cfg.get("noise_gate_rnnoise_vad_prob", 0.45)
-        min_noise_speech_frames = cfg.get("noise_gate_min_speech_frames", 2)
-        noise_gate_chars = set(cfg.get("noise_gate_filter_chars", ["嗯", "喂"]))
+        min_noise_vad_prob = self._noise_gate_rnnoise_vad_prob
+        min_noise_speech_frames = self._noise_gate_min_speech_frames
+        noise_gate_chars = self._noise_gate_filter_chars
         looks_like_noise = bool(is_speech and rnnoise_vad_prob < min_noise_vad_prob)
         self._noise_speech_streak = self._noise_speech_streak + 1 if looks_like_noise else 0
 
@@ -307,7 +364,7 @@ class StreamHandler:
                              should_interrupt)
                 if should_interrupt:
                     logger.info("call_id=%s step1.5 interrupt triggered", self.call_id)
-                    asyncio.create_task(self._send_interrupt())
+                    self._create_safe_task(self._send_interrupt())
         else:
             logger.debug("call_id=%s step1.5 interrupt check skipped: interrupt_enabled=false", self.call_id)
         _t3 = time.monotonic()
@@ -335,7 +392,7 @@ class StreamHandler:
         else:
             self._audio_lookback.append(audio_bytes)
             self._lookback_samples += len(audio_bytes) // 2
-            max_lookback_ms = cfg.get("noise_gate_lookback_ms", 180)
+            max_lookback_ms = self._noise_gate_lookback_ms
             max_lookback_samples = max_lookback_ms * 16
             while self._lookback_samples > max_lookback_samples and self._audio_lookback:
                 removed = self._audio_lookback.popleft()
@@ -402,8 +459,8 @@ class StreamHandler:
                     logger.info("call_id=%s step3 sentence done (silence %dms  max_silence %dms): %s",
                                 self.call_id, silence_ms, self._silence_max_ms, sentence)
                     logger.info("call_id=%s step3 intent task scheduled (epoch=%d)", self.call_id, sentence_epoch)
-                    asyncio.create_task(self._send_transcript(sentence))
-                    asyncio.create_task(self._call_intent(sentence, sentence_epoch))
+                    self._create_safe_task(self._send_transcript(sentence))
+                    self._create_safe_task(self._call_intent(sentence, sentence_epoch))
 
         self._elapsed_ms = end_ms
         logger.debug("call_id=%s handle_audio end: elapsed_ms=%d", self.call_id, self._elapsed_ms)
@@ -411,6 +468,15 @@ class StreamHandler:
     # ------------------------------------------------------------------ #
     #  Intent                                                              #
     # ------------------------------------------------------------------ #
+
+    def _create_safe_task(self, coro: Awaitable[Any]) -> None:
+        async def _runner() -> None:
+            try:
+                await coro
+            except Exception as e:
+                logger.error("call_id=%s background task failed: %s", self.call_id, e)
+
+        asyncio.create_task(_runner())
 
     async def _call_intent(self, sentence: str, sentence_epoch: int | None = None) -> None:
         url = f"{cfg.get('intent_service_url')}/api/v1/recognize"
