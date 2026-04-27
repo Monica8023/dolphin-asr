@@ -234,6 +234,18 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                 continue
 
             if audio_bytes is not None:
+                input_sample_rate = int(cfg.get("audio_input_sample_rate", 16000))
+                bytes_per_sample = 2  # PCM16
+                num_samples = len(audio_bytes) // bytes_per_sample
+                chunk_ms = int(num_samples / input_sample_rate * 1000) if input_sample_rate > 0 else 0
+                logger.info(
+                    "call_id=%s ws audio frame received: bytes=%d samples=%d sample_rate=%d chunk_ms=%d",
+                    call_id,
+                    len(audio_bytes),
+                    num_samples,
+                    input_sample_rate,
+                    chunk_ms,
+                )
                 if not stream_active:
                     continue
                 try:

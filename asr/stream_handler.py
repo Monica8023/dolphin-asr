@@ -111,6 +111,10 @@ class StreamHandler:
         """连接建立后调用，启动无应答计时器。"""
         self._no_answer_task = asyncio.create_task(self._no_answer_timer())
 
+    def _timer_start_delay_s(self) -> float:
+        """统一计时器起始延迟窗：start 事件后的 ignore_start_seconds。"""
+        return max(0.0, self._interrupt_allow_after - time.monotonic())
+
     def stop_timers(self) -> None:
         """连接断开或流程结束时调用。"""
         if self._no_answer_task:
@@ -147,12 +151,27 @@ class StreamHandler:
         intervene_cfg = call_conf.get("interveneConfig") or {}
 
         self._silence_max_ms = call_conf.get("maxPauseTime") or self._silence_max_ms
-        self._no_answer_timeout_ms = call_conf.get("noResponseTime") or self._no_answer_timeout_ms
+        no_response_time = call_conf.get("noResponseTime")
+        if no_response_time is not None:
+            try:
+                parsed_no_response_time = float(no_response_time)
+                if parsed_no_response_time >= 0:
+                    self._no_answer_timeout_ms = int(parsed_no_response_time * 1000)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "call_id=%s model_id=%s invalid noResponseTime=%r, keep previous=%s",
+                    self.call_id,
+                    self.model_id,
+                    no_response_time,
+                    self._no_answer_timeout_ms,
+                )
         self._match_timeout_ms = call_conf.get("matchTimeout") or self._match_timeout_ms
-        if "enable" in interrupt_cfg:
-            self._interrupt_enabled = interrupt_cfg["enable"]
-        self._interrupt_threshold_ms = interrupt_cfg.get("interruptTime") or self._interrupt_threshold_ms
-        self._interrupt_ignore_start_ms = (interrupt_cfg.get("startIgnoreSeconds") or 0) * 1000
+        interrupt_enabled = interrupt_cfg.get("enable")
+        if interrupt_enabled is not None:
+            self._interrupt_enabled = bool(interrupt_enabled)
+            if self._interrupt_enabled:
+                self._interrupt_threshold_ms = interrupt_cfg.get("interruptTime") or self._interrupt_threshold_ms
+                self._interrupt_ignore_start_ms = (interrupt_cfg.get("startIgnoreSeconds") or 0) * 1000
 
         type_threshold = intervene_cfg.get("wordCount")
 
@@ -438,7 +457,7 @@ class StreamHandler:
         else:
             if self._in_speech and self._last_speech_end_ms is not None:
                 silence_ms = end_ms - self._last_speech_end_ms
-                logger.info(
+                logger.debug(
                     "call_id=%s step3 silence check: silence_ms=%d threshold_ms=%d has_sentence_parts=%s",
                     self.call_id,
                     silence_ms,
@@ -577,19 +596,37 @@ class StreamHandler:
     # ------------------------------------------------------------------ #
 
     async def _no_answer_timer(self) -> None:
+        start_delay_s = self._timer_start_delay_s()
+        if start_delay_s > 0:
+            await asyncio.sleep(start_delay_s)
+
         timeout_s = self._no_answer_timeout_ms / 1000
         await asyncio.sleep(timeout_s)
         if not self._paused and not self._no_answer_sent:
-            logger.info("call_id=%s no_answer timeout (%.1fs)", self.call_id, timeout_s)
+            logger.info(
+                "call_id=%s no_answer timeout (delay=%.1fs timeout=%.1fs)",
+                self.call_id,
+                start_delay_s,
+                timeout_s,
+            )
             await self._send_no_answer()
             self._no_answer_sent = True
             self._reset_sentence_state()
 
     async def _match_timer(self) -> None:
+        start_delay_s = self._timer_start_delay_s()
+        if start_delay_s > 0:
+            await asyncio.sleep(start_delay_s)
+
         timeout_s = self._match_timeout_ms / 1000
         await asyncio.sleep(timeout_s)
         if not self._paused:
-            logger.info("call_id=%s match timeout (%.1fs)", self.call_id, timeout_s)
+            logger.info(
+                "call_id=%s match timeout (delay=%.1fs timeout=%.1fs)",
+                self.call_id,
+                start_delay_s,
+                timeout_s,
+            )
             await self._send_fallback()
             self._reset_sentence_state()
 

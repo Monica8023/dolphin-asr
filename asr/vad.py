@@ -7,6 +7,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _vad_model = None
+_VAD_SAMPLE_RATE = 16000
+_MIN_FEATURE_WINDOW_SAMPLES = 400  # 16kHz 下 25ms，至少要能凑出 1 帧特征
+_SHORT_CHUNK_THRESHOLD_SAMPLES = 640  # 40ms 以下视为短包，走滑动窗无状态 VAD
+_SHORT_VAD_WINDOW_SAMPLES = 640  # 最近 40ms 窗口
 
 
 def load_vad_model() -> None:
@@ -31,15 +35,81 @@ class VADDetector:
         self._interrupted = False
         self._vad_cache: dict = {}
         self._is_speaking = False
-        self._chunk_ms: int | None = None
         self._cache_frame_count: int = 0
         self._cache_reset_interval_frames: int = 6000
+        self._recent_audio = bytearray()
 
     def reset(self) -> None:
         self._speech_start = None
         self._interrupted = False
         self._vad_cache = {}
+        self._is_speaking = False
         self._cache_frame_count = 0
+        self._recent_audio.clear()
+
+    @staticmethod
+    def _extract_events(result) -> list:
+        if isinstance(result, list) and result:
+            first = result[0]
+            if isinstance(first, dict):
+                return first.get("value") or []
+        return []
+
+    def _run_streaming_vad(self, audio_bytes: bytes) -> bool:
+        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        chunk_ms = max(1, len(audio_np) // 16)
+        result = _vad_model.generate(
+            input=audio_np,
+            cache=self._vad_cache,
+            is_final=False,
+            chunk_size=chunk_ms,
+            disable_pbar=True,
+        )
+        self._cache_frame_count += 1
+        if self._cache_frame_count >= self._cache_reset_interval_frames:
+            self._vad_cache = {}
+            self._cache_frame_count = 0
+
+        events = self._extract_events(result)
+        if events:
+            for event in events:
+                start, end = event[0], event[1]
+                if start != -1 and end == -1:
+                    self._is_speaking = True
+                elif start == -1 and end != -1:
+                    self._is_speaking = False
+        return self._is_speaking
+
+    def _run_short_chunk_vad(self, audio_bytes: bytes) -> bool:
+        self._vad_cache = {}
+        self._cache_frame_count = 0
+
+        self._recent_audio.extend(audio_bytes)
+        max_recent_bytes = _SHORT_VAD_WINDOW_SAMPLES * 2
+        if len(self._recent_audio) > max_recent_bytes:
+            del self._recent_audio[:-max_recent_bytes]
+
+        buffered_samples = len(self._recent_audio) // 2
+        if buffered_samples < _MIN_FEATURE_WINDOW_SAMPLES:
+            logger.debug(
+                "VAD buffering short frame: buffered_samples=%d min_required=%d",
+                buffered_samples,
+                _MIN_FEATURE_WINDOW_SAMPLES,
+            )
+            return self._is_speaking
+
+        window_audio_bytes = bytes(self._recent_audio)
+        audio_np = np.frombuffer(window_audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        chunk_ms = max(1, len(audio_np) // 16)
+        result = _vad_model.generate(
+            input=audio_np,
+            cache={},
+            is_final=False,
+            chunk_size=chunk_ms,
+            disable_pbar=True,
+        )
+        self._is_speaking = bool(self._extract_events(result))
+        return self._is_speaking
 
     def is_speech(self, audio_bytes: bytes) -> bool:
         """解析 FunASR 输出事件，更新 _is_speaking 状态"""
@@ -47,39 +117,20 @@ class VADDetector:
             return self._is_speaking
 
         if _vad_model is not None:
-            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            if self._chunk_ms is None:
-                self._chunk_ms = max(1, len(audio_np) // 16)
-            chunk_ms = self._chunk_ms
-            try:
-                result = _vad_model.generate(
-                    input=audio_np,
-                    cache=self._vad_cache,
-                    is_final=False,
-                    chunk_size=chunk_ms,
-                    disable_pbar=True,
-                )
-                self._cache_frame_count += 1
-                if self._cache_frame_count >= self._cache_reset_interval_frames:
-                    self._vad_cache = {}
-                    self._cache_frame_count = 0
+            if len(audio_bytes) % 2 != 0:
+                audio_bytes = audio_bytes[:-1]
+                if not audio_bytes:
+                    return self._is_speaking
 
-                # 解析 FSMN-VAD 的事件流
-                if result and "value" in result[0]:
-                    events = result[0]["value"]
-                    for event in events:
-                        start, end = event[0], event[1]
-                        if start != -1 and end == -1:
-                            self._is_speaking = True  # 语音开始
-                        elif start == -1 and end != -1:
-                            self._is_speaking = False  # 语音结束
-                        elif start != -1 and end != -1:
-                            # 极短的一段声音（可能在一个 chunk 内开始和结束）
-                            # 可以根据需求决定是否忽略这种极短的噪音脉冲
-                            pass
-                return self._is_speaking
+            num_samples = len(audio_bytes) // 2
+            try:
+                if num_samples < _SHORT_CHUNK_THRESHOLD_SAMPLES:
+                    return self._run_short_chunk_vad(audio_bytes)
+                return self._run_streaming_vad(audio_bytes)
 
             except Exception as e:
+                self._vad_cache = {}
+                self._cache_frame_count = 0
                 logger.warning("FSMN-VAD inference failed, fallback to energy: %s", e)
 
         # 能量降级逻辑

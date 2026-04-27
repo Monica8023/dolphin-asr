@@ -19,7 +19,7 @@ DEFAULT_CONFIG = {
     "no_answer_timeout_ms": 10000,
     "match_timeout_ms": 15000,
     "log_path": "./log",
-    "log_level": "debug",
+    "log_level": "info",
     "asr_model_path": "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
     "vad_model_path": "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
     "enhancer_model_path": "D:/model/iic/speech_zipenhancer_ans_multiloss_16k_base",
@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
     "vad_workers": 4,
     "vad_energy_threshold": 500,
     "vad_gate_asr": False,
+    "audio_queue_maxsize": 64,
 }
 
 _config: dict[str, Any] = {}
