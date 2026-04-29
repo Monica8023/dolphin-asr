@@ -65,6 +65,10 @@ class StreamHandler:
         self._match_timeout_ms: int = cfg.get("match_timeout_ms", 15000)
         self._interrupt_enabled: bool = cfg.get("interrupt_enabled", True)
         self._interrupt_threshold_ms: int = cfg.get("vad_interrupt_threshold_ms", 2000)
+        self._interrupt_silence_tolerance_ms: int = int(
+            cfg.get("interrupt_silence_tolerance_ms", self._silence_max_ms)
+        )
+        self._interrupt_rnnoise_vad_prob: float = float(cfg.get("interrupt_rnnoise_vad_prob", 0.5))
         self._noise_gate_rnnoise_vad_prob: float = cfg.get("noise_gate_rnnoise_vad_prob", 0.45)
         self._noise_gate_min_speech_frames: int = cfg.get("noise_gate_min_speech_frames", 2)
         self._noise_gate_filter_chars: set[str] = set(cfg.get("noise_gate_filter_chars", ["嗯", "喂"]))
@@ -73,10 +77,16 @@ class StreamHandler:
         self._word_count: int = 2
         self._question_similarity: float | None = None
 
-        self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
+        self._vad = VADDetector(
+            threshold_ms=self._interrupt_threshold_ms,
+            silence_tolerance_ms=self._interrupt_silence_tolerance_ms,
+        )
         self._asr = ASREngine()
         self._denoiser = RNNoiseFilter()  # 每路连接独立实例，线程安全
-        self._resampler = _Resampler8kTo16k() if cfg.get("audio_input_sample_rate", 16000) != 16000 else None
+        self._vad_gate_asr: bool = bool(cfg.get("vad_gate_asr", False))
+        self._audio_input_sample_rate: int = int(cfg.get("audio_input_sample_rate", 16000))
+        self._audio_input_codec: str = "pcm16"
+        self._resampler = _Resampler8kTo16k() if self._audio_input_sample_rate != 16000 else None
         self._paused = True
 
         # 当前句子文本缓冲
@@ -97,6 +107,7 @@ class StreamHandler:
         self._audio_lookback: deque[bytes] = deque(maxlen=3)
         self._lookback_samples: int = 0
         self._noise_speech_streak: int = 0
+        self._rnnoise_length_mismatch_logged: bool = False
 
         # 计时器
         self._no_answer_task: asyncio.Task | None = None
@@ -120,23 +131,34 @@ class StreamHandler:
         if self._no_answer_task:
             self._no_answer_task.cancel()
             self._no_answer_task = None
+        self._cancel_match_timeout_timer()
+
+    def _cancel_match_timeout_timer(self) -> None:
+        """取消会话级匹配超时计时器。pause/stop/resume/命中意图时调用。"""
         if self._match_timeout_task:
-            self._match_timeout_task.cancel()
+            task = self._match_timeout_task
             self._match_timeout_task = None
+            try:
+                current_task = asyncio.current_task()
+            except RuntimeError:
+                current_task = None
+            if task is not current_task:
+                task.cancel()
+        self._first_text_received = False
 
     def pause(self) -> None:
         """由 pause/stop 事件调用：暂停识别并重置状态。"""
         self.stop_timers()
         self._paused = True
         self._no_answer_sent = False
-        self._reset_sentence_state()
+        self._reset_sentence_state(reset_interrupt=True)
 
     def resume(self) -> None:
         """由 start 事件调用：重置状态并重新启动计时器。"""
         self.stop_timers()
         self._paused = False
         self._no_answer_sent = False
-        self._reset_sentence_state()
+        self._reset_sentence_state(reset_interrupt=True)
         # 记录打断禁区截止时刻
         self._interrupt_allow_after = time.monotonic() + self._interrupt_ignore_start_ms / 1000
         self.start_timers()
@@ -170,8 +192,71 @@ class StreamHandler:
         if interrupt_enabled is not None:
             self._interrupt_enabled = bool(interrupt_enabled)
             if self._interrupt_enabled:
-                self._interrupt_threshold_ms = interrupt_cfg.get("interruptTime") or self._interrupt_threshold_ms
-                self._interrupt_ignore_start_ms = (interrupt_cfg.get("startIgnoreSeconds") or 0) * 1000
+                interrupt_time = interrupt_cfg.get("interruptTime")
+                if interrupt_time is not None:
+                    try:
+                        parsed_interrupt_time = int(interrupt_time)
+                        if parsed_interrupt_time >= 0:
+                            self._interrupt_threshold_ms = parsed_interrupt_time
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "call_id=%s model_id=%s invalid interruptTime=%r, keep previous=%s",
+                            self.call_id,
+                            self.model_id,
+                            interrupt_time,
+                            self._interrupt_threshold_ms,
+                        )
+
+                start_ignore_seconds = interrupt_cfg.get("startIgnoreSeconds")
+                if start_ignore_seconds is not None:
+                    try:
+                        parsed_ignore_seconds = float(start_ignore_seconds)
+                        if parsed_ignore_seconds >= 0:
+                            self._interrupt_ignore_start_ms = int(parsed_ignore_seconds * 1000)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "call_id=%s model_id=%s invalid startIgnoreSeconds=%r, keep previous=%s",
+                            self.call_id,
+                            self.model_id,
+                            start_ignore_seconds,
+                            self._interrupt_ignore_start_ms,
+                        )
+
+                silence_tolerance_ms = interrupt_cfg.get("silenceToleranceMs")
+                if silence_tolerance_ms is not None:
+                    try:
+                        parsed_tolerance_ms = int(silence_tolerance_ms)
+                        if parsed_tolerance_ms >= 0:
+                            self._interrupt_silence_tolerance_ms = parsed_tolerance_ms
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "call_id=%s model_id=%s invalid silenceToleranceMs=%r, keep previous=%s",
+                            self.call_id,
+                            self.model_id,
+                            silence_tolerance_ms,
+                            self._interrupt_silence_tolerance_ms,
+                        )
+
+                rnnoise_vad_prob = interrupt_cfg.get("rnnoiseVadProb")
+                if rnnoise_vad_prob is not None:
+                    try:
+                        parsed_rnnoise_vad_prob = float(rnnoise_vad_prob)
+                        if parsed_rnnoise_vad_prob >= 0:
+                            self._interrupt_rnnoise_vad_prob = parsed_rnnoise_vad_prob
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "call_id=%s model_id=%s invalid rnnoiseVadProb=%r, keep previous=%s",
+                            self.call_id,
+                            self.model_id,
+                            rnnoise_vad_prob,
+                            self._interrupt_rnnoise_vad_prob,
+                        )
+
+        if self._interrupt_enabled and "silenceToleranceMs" not in interrupt_cfg:
+            self._interrupt_silence_tolerance_ms = max(
+                self._interrupt_silence_tolerance_ms,
+                int(self._silence_max_ms),
+            )
 
         type_threshold = intervene_cfg.get("wordCount")
 
@@ -281,29 +366,36 @@ class StreamHandler:
             self._noise_gate_filter_chars = set(noise_gate_chars)
 
 
-        self._vad = VADDetector(threshold_ms=self._interrupt_threshold_ms)
+        self._vad = VADDetector(
+            threshold_ms=self._interrupt_threshold_ms,
+            silence_tolerance_ms=self._interrupt_silence_tolerance_ms,
+        )
         logger.info(
-            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms type_threshold=%s question_similarity=%s",
+            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms interrupt_tolerance=%dms interrupt_rnnoise_prob=%.2f type_threshold=%s question_similarity=%s",
             self.call_id, self.model_id,
             self._silence_max_ms, self._no_answer_timeout_ms,
             self._interrupt_enabled, self._interrupt_threshold_ms,
-            self._interrupt_ignore_start_ms, self._word_count,self._question_similarity
+            self._interrupt_ignore_start_ms, self._interrupt_silence_tolerance_ms,
+            self._interrupt_rnnoise_vad_prob, self._word_count,self._question_similarity
         )
 
-    def _reset_sentence_state(self) -> None:
+    def _reset_sentence_state(self, reset_interrupt: bool = False, reset_models: bool = True) -> None:
         """每句话处理完毕后调用，重置句子级状态，允许持续识别下一句。"""
         self._sentence_parts = []
         self._in_speech = False
         self._last_speech_end_ms = None
-        self._first_text_received = False
         self._audio_lookback.clear()
         self._lookback_samples = 0
         self._noise_speech_streak = 0
-        if self._match_timeout_task:
-            self._match_timeout_task.cancel()
-            self._match_timeout_task = None
+        if not reset_models:
+            if reset_interrupt:
+                self._vad.reset_interrupt_state()
+            return
         self._asr.reset()
-        self._vad.reset()
+        if reset_interrupt:
+            self._vad.reset()
+        else:
+            self._vad.reset_detection_state()
         self._denoiser.reset()
 
     async def close(self) -> None:
@@ -337,16 +429,25 @@ class StreamHandler:
         else:
             raw_audio = audio_bytes
 
-        # 0b. RNNoise 降噪 + VAD 语音判定（并行执行）
+        # 0b. RNNoise 仅用于噪声概率，ASR 仍使用原始上采样 PCM，避免降噪重采样改变流式时序。
         denoise_future = loop.run_in_executor(self._vad_executor, self._denoiser.process, raw_audio)
         vad_future = loop.run_in_executor(self._vad_executor, self._vad.is_speech, raw_audio)
-        (audio_bytes, rnnoise_vad_prob), is_speech = await asyncio.gather(denoise_future, vad_future)
+        (denoised_audio, rnnoise_vad_prob), is_speech = await asyncio.gather(denoise_future, vad_future)
         _t1 = time.monotonic()
-        if not audio_bytes:
+        if not raw_audio:
             return
+        if denoised_audio and len(denoised_audio) != len(raw_audio):
+            log_fn = logger.info if not self._rnnoise_length_mismatch_logged else logger.debug
+            log_fn(
+                "call_id=%s rnnoise length mismatch ignored: raw=%d denoised=%d",
+                self.call_id,
+                len(raw_audio),
+                len(denoised_audio),
+            )
+            self._rnnoise_length_mismatch_logged = True
 
         bytes_per_sample = 2  # 16-bit
-        num_samples = len(audio_bytes) // bytes_per_sample
+        num_samples = len(raw_audio) // bytes_per_sample
         self._total_samples += num_samples
 
         end_ms = int(self._total_samples / 16000 * 1000)
@@ -354,7 +455,7 @@ class StreamHandler:
         logger.debug(
             "call_id=%s handle_audio start: bytes=%d chunk_ms=%d elapsed_ms=%d end_ms=%d",
             self.call_id,
-            len(audio_bytes),
+            len(raw_audio),
             chunk_ms,
             self._elapsed_ms,
             end_ms,
@@ -369,16 +470,30 @@ class StreamHandler:
         looks_like_noise = bool(is_speech and rnnoise_vad_prob < min_noise_vad_prob)
         self._noise_speech_streak = self._noise_speech_streak + 1 if looks_like_noise else 0
 
-        # 1.5 打断检测（基于 step1 的 is_speech，不重复跑 VAD）
+        # 1.5 打断检测（基于 step1 的 VAD + RNNoise 概率，不重复跑 VAD）
+        interrupt_speech = bool(is_speech or rnnoise_vad_prob >= self._interrupt_rnnoise_vad_prob)
         if self._interrupt_enabled:
             in_ignore_window = time.monotonic() < self._interrupt_allow_after
             if in_ignore_window:
                 logger.debug("call_id=%s step1.5 interrupt check skipped: in ignore window", self.call_id)
-                # 仍需驱动 process_speech 以维护 VAD 内部状态，但不触发打断
-                await loop.run_in_executor(self._vad_executor, self._vad.process_speech, is_speech)
+                # 仍需驱动 process_speech 以维护语音/静音边界，但 ignore 窗口内不累计打断时长。
+                await loop.run_in_executor(self._vad_executor, self._vad.process_speech, interrupt_speech, 0, False)
             else:
-                logger.debug("call_id=%s step1.5 interrupt check start", self.call_id)
-                should_interrupt = await loop.run_in_executor(self._vad_executor, self._vad.process_speech, is_speech)
+                logger.debug(
+                    "call_id=%s step1.5 interrupt check start speech=%s vad=%s rnnoise=%.3f threshold=%.3f chunk_ms=%d",
+                    self.call_id,
+                    interrupt_speech,
+                    is_speech,
+                    rnnoise_vad_prob,
+                    self._interrupt_rnnoise_vad_prob,
+                    chunk_ms,
+                )
+                should_interrupt = await loop.run_in_executor(
+                    self._vad_executor,
+                    self._vad.process_speech,
+                    interrupt_speech,
+                    chunk_ms,
+                )
                 logger.debug("call_id=%s step1.5 interrupt check result: should_interrupt=%s", self.call_id,
                              should_interrupt)
                 if should_interrupt:
@@ -390,15 +505,21 @@ class StreamHandler:
 
         # 2. 流式 ASR 转写：音频帧必须完整送入以维持模型内部状态连续性
         text = ""
-        if is_speech:
-            if not self._in_speech and self._audio_lookback:
+        should_feed_asr = is_speech or not self._vad_gate_asr
+        if should_feed_asr:
+            if self._vad_gate_asr and is_speech and not self._in_speech and self._audio_lookback:
                 lookback_audio = b"".join(self._audio_lookback)
                 await loop.run_in_executor(self._asr_executor, self._asr.transcribe, lookback_audio)
                 self._audio_lookback.clear()
                 self._lookback_samples = 0
                 logger.debug("call_id=%s step2 lookback frames fed to ASR", self.call_id)
-            logger.debug("call_id=%s step2 asr transcribe start (is_speech=True)", self.call_id)
-            text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, audio_bytes)
+            logger.debug(
+                "call_id=%s step2 asr transcribe start (is_speech=%s vad_gate_asr=%s)",
+                self.call_id,
+                is_speech,
+                self._vad_gate_asr,
+            )
+            text = await loop.run_in_executor(self._asr_executor, self._asr.transcribe, raw_audio)
             if text and self._noise_speech_streak < min_noise_speech_frames and set(text) <= noise_gate_chars:
                 logger.info(
                     "call_id=%s step2 noise-gate drop text=%r streak=%d rnnoise_vad_prob=%.3f",
@@ -409,8 +530,8 @@ class StreamHandler:
                 )
                 text = ""
         else:
-            self._audio_lookback.append(audio_bytes)
-            self._lookback_samples += len(audio_bytes) // 2
+            self._audio_lookback.append(raw_audio)
+            self._lookback_samples += len(raw_audio) // 2
             max_lookback_ms = self._noise_gate_lookback_ms
             max_lookback_samples = max_lookback_ms * 16
             while self._lookback_samples > max_lookback_samples and self._audio_lookback:
@@ -448,7 +569,8 @@ class StreamHandler:
             logger.debug("call_id=%s step2 asr empty text", self.call_id)
 
         # 3. 停顿检测 → 句子结束判定
-        if is_speech:
+        effective_speech = is_speech or bool(text)
+        if effective_speech:
             if not self._in_speech:
                 self._in_speech = True
                 logger.debug("call_id=%s step3 speech segment started", self.call_id)
@@ -531,6 +653,7 @@ class StreamHandler:
         logger.info("call_id=%s intent_id=%s text=%r epoch=%s", self.call_id, intent_id, sentence, sentence_epoch)
 
         if intent_id != "intent_unknown":
+            self._cancel_match_timeout_timer()
             await self._send_callback(intent_id, sentence)
 
     # ------------------------------------------------------------------ #
@@ -611,7 +734,7 @@ class StreamHandler:
             )
             await self._send_no_answer()
             self._no_answer_sent = True
-            self._reset_sentence_state()
+            self._reset_sentence_state(reset_interrupt=True)
 
     async def _match_timer(self) -> None:
         start_delay_s = self._timer_start_delay_s()
@@ -628,7 +751,11 @@ class StreamHandler:
                 timeout_s,
             )
             await self._send_fallback()
-            self._reset_sentence_state()
+            self._match_timeout_task = None
+            self._first_text_received = False
+            self._sentence_epoch += 1
+            self._reset_sentence_state(reset_interrupt=True, reset_models=False)
+            logger.info("call_id=%s match timeout state reset without pausing ASR", self.call_id)
 
     def _reset_no_answer_timer(self) -> None:
         if self._no_answer_task:

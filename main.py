@@ -129,6 +129,11 @@ async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: st
         handler.resume()
         return False
 
+    if event == "resume":
+        logger.info("call_id=%s event=resume: ASR resumed, no_answer timer reset", call_id)
+        handler.resume()
+        return False
+
     if event == "pause":
         logger.info("call_id=%s event=pause: ASR paused", call_id)
         handler.pause()
@@ -222,7 +227,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
 
                 should_close = await _handle_ws_event(websocket, handler, text, call_id)
 
-                if event == "start":
+                if event in {"start", "resume"}:
                     stream_active = True
                     await _drain_audio_queue(audio_queue)
                 elif event in {"pause", "stop"}:
@@ -234,16 +239,18 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                 continue
 
             if audio_bytes is not None:
-                input_sample_rate = int(cfg.get("audio_input_sample_rate", 16000))
-                bytes_per_sample = 2  # PCM16
+                input_sample_rate = int(getattr(handler, "_audio_input_sample_rate", cfg.get("audio_input_sample_rate", 16000)))
+                input_codec = "pcm16"
+                bytes_per_sample = 2
                 num_samples = len(audio_bytes) // bytes_per_sample
                 chunk_ms = int(num_samples / input_sample_rate * 1000) if input_sample_rate > 0 else 0
                 logger.info(
-                    "call_id=%s ws audio frame received: bytes=%d samples=%d sample_rate=%d chunk_ms=%d",
+                    "call_id=%s ws audio frame received: bytes=%d samples=%d sample_rate=%d codec=%s chunk_ms=%d",
                     call_id,
                     len(audio_bytes),
                     num_samples,
                     input_sample_rate,
+                    input_codec,
                     chunk_ms,
                 )
                 if not stream_active:

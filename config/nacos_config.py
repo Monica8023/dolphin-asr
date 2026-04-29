@@ -34,6 +34,8 @@ DEFAULT_CONFIG = {
     "vad_energy_threshold": 500,
     "vad_gate_asr": False,
     "audio_queue_maxsize": 64,
+    "audio_input_sample_rate": 16000,
+    "audio_input_codec": "pcm16",
 }
 
 _config: dict[str, Any] = {}

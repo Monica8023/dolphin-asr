@@ -19,7 +19,8 @@ no_answer_timeout_ms: 10000
 match_timeout_ms: 15000
 
 log_path: "./log"
-log_level: "INFO"
+# log_level 建议生产环境使用 WARNING，减少高并发下日志I/O阻塞
+log_level: "WARNING"
 
 # FunASR 模型配置（路径通过此处配置，支持 Nacos 热更新）
 asr_model_path: "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
@@ -32,6 +33,8 @@ asr_chunk_size: [0, 2, 1]
 asr_encoder_chunk_look_back: 7
 asr_decoder_chunk_look_back: 1
 intent_epoch_guard_enabled: true
+# ONNX Runtime 线程数：GPU 环境建议 1，避免与在线ASR线程池叠加导致CPU过度订阅
+asr_num_threads: 1
 asr_workers: 8
 vad_workers: 4
 enhancer_workers: 2
@@ -57,3 +60,5 @@ vad_gate_asr: false
 # 输入音频采样率（Hz）：8000=正式环境 8kHz，16000=测试环境 16kHz
 # 非 16000 时自动上采样到 16kHz 再送入各模型；已是 16kHz 则直接透传
 audio_input_sample_rate: 8000
+# 输入音频编码：pcm16 / pcmu / pcma
+audio_input_codec: "pcm16"
