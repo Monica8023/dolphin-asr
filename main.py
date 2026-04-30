@@ -207,7 +207,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
     consumer_task = asyncio.create_task(_audio_consumer_loop(handler, audio_queue))
     stream_active = False
 
-    logger.info("WebSocket connected: call_id=%s", call_id)
+    logger.debug("WebSocket connected: call_id=%s", call_id)
     try:
         while True:
             message = await websocket.receive()
@@ -216,7 +216,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
             audio_bytes = message.get("bytes")
 
             if msg_type == "websocket.disconnect":
-                logger.info("WebSocket message indicates disconnect: call_id=%s", call_id)
+                logger.debug("WebSocket message indicates disconnect: call_id=%s", call_id)
                 break
 
             if text is not None:
@@ -244,7 +244,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                 bytes_per_sample = 2
                 num_samples = len(audio_bytes) // bytes_per_sample
                 chunk_ms = int(num_samples / input_sample_rate * 1000) if input_sample_rate > 0 else 0
-                logger.info(
+                logger.debug(
                     "call_id=%s ws audio frame received: bytes=%d samples=%d sample_rate=%d codec=%s chunk_ms=%d",
                     call_id,
                     len(audio_bytes),

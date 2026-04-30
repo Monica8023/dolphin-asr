@@ -74,7 +74,7 @@ class StreamHandler:
         self._noise_gate_filter_chars: set[str] = set(cfg.get("noise_gate_filter_chars", ["嗯", "喂"]))
         self._noise_gate_lookback_ms: int = cfg.get("noise_gate_lookback_ms", 180)
         self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
-        self._word_count: int = 2
+        self._word_count: int | None = 2
         self._question_similarity: float | None = None
 
         self._vad = VADDetector(

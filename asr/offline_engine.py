@@ -11,7 +11,6 @@ _offline_model = None
 def load_offline_model() -> None:
     """启动时加载一次全局离线 ASR 模型。"""
     global _offline_model
-    import funasr.models.paraformer.model
     from funasr import AutoModel
     from config import nacos_config as cfg
 
