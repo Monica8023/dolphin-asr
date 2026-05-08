@@ -4,7 +4,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import httpx
 import redis.asyncio as aioredis
@@ -75,12 +75,6 @@ async def lifespan(app: FastAPI):
 
     logger.info("dolphin-asr service started.")
     yield
-
-    await app.state.http_client.aclose()
-    await app.state.redis.aclose()
-    executors.vad.shutdown(wait=False)
-    executors.asr.shutdown(wait=False)
-    executors.offline_asr.shutdown(wait=False)
     logger.info("dolphin-asr service stopped.")
 
 
@@ -208,6 +202,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
     stream_active = False
 
     logger.debug("WebSocket connected: call_id=%s", call_id)
+    handler.emit_monitor_event("ws_open", text="websocket accepted", model_id=model_id)
     try:
         while True:
             message = await websocket.receive()
@@ -233,6 +228,9 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                 elif event in {"pause", "stop"}:
                     stream_active = False
                     await _drain_audio_queue(audio_queue)
+
+                if event in {"start", "resume", "pause", "stop"}:
+                    handler.emit_monitor_event(f"ws_{event}", text=f"control={event}")
 
                 if should_close:
                     break
@@ -277,12 +275,8 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
     except Exception as e:
         logger.error("WebSocket error call_id=%s: %s", call_id, e)
     finally:
-        _enqueue_sentinel(audio_queue)
-        try:
-            await asyncio.wait_for(consumer_task, timeout=3.0)
-        except asyncio.TimeoutError:
-            consumer_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await consumer_task
-            logger.warning("call_id=%s audio consumer did not exit in time, cancelled", call_id)
-        await handler.close()
+        handler.emit_monitor_event("ws_close", text="websocket closed")
+        consumer_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumer_task
+        return

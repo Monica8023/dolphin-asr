@@ -619,6 +619,9 @@ class StreamHandler:
 
         asyncio.create_task(_runner())
 
+    def emit_monitor_event(self, event: str, text: str | None = None, **extra: Any) -> None:
+        self._create_safe_task(self.send_monitor_event(event, text=text, **extra))
+
     async def _call_intent(self, sentence: str, sentence_epoch: int | None = None) -> None:
         url = f"{cfg.get('intent_service_url')}/api/v1/recognize"
         payload: dict = {
@@ -649,12 +652,56 @@ class StreamHandler:
             )
             return
 
-        intent_id = data.get("intent_id", "intent_unknown")
-        logger.info("call_id=%s intent_id=%s text=%r epoch=%s", self.call_id, intent_id, sentence, sentence_epoch)
+        intent_id = str(data.get("intent_id", "intent_unknown"))
+        matched_text = data.get("matched_text") or ""
+        normalized_text = data.get("normalized_text") or sentence
+        match_source = data.get("match_source")
+        keyword_hit = bool(data.get("keyword_hit", False))
+        vector_match_attempted = bool(data.get("vector_match_attempted", False))
+        vector_candidates = data.get("vector_candidates") or []
+        final_branch = data.get("final_branch")
+        fallback_reason = data.get("fallback_reason")
+        confidence = data.get("confidence")
+        threshold = data.get("threshold")
+        gap_score = data.get("gap_score")
+
+        logger.info(
+            "call_id=%s intent_id=%s source=%s branch=%s fallback=%s sentence=%r matched_text=%r epoch=%s",
+            self.call_id,
+            intent_id,
+            match_source,
+            final_branch,
+            fallback_reason,
+            sentence,
+            matched_text,
+            sentence_epoch,
+        )
+
+        monitor_task = self._send_monitor_intent(
+            intent_id=intent_id,
+            matched_text=matched_text,
+            asr_final_text=sentence,
+            normalized_text=normalized_text,
+            match_source=match_source,
+            keyword_hit=keyword_hit,
+            vector_match_attempted=vector_match_attempted,
+            vector_candidates=vector_candidates,
+            final_branch=final_branch,
+            fallback_reason=fallback_reason,
+            confidence=confidence,
+            threshold=threshold,
+            gap_score=gap_score,
+        )
 
         if intent_id != "intent_unknown":
             self._cancel_match_timeout_timer()
-            await self._send_callback(intent_id, sentence)
+            await asyncio.gather(
+                self._send_callback(intent_id, sentence),
+                monitor_task,
+            )
+            return
+
+        await monitor_task
 
     # ------------------------------------------------------------------ #
     #  对外推送                                                             #
@@ -670,15 +717,67 @@ class StreamHandler:
         }
         await self._post(cfg.get("business_callback_url"), payload, "intent callback")
 
+    async def _send_monitor_intent(
+        self,
+        intent_id: str,
+        matched_text: str,
+        asr_final_text: str,
+        normalized_text: str | None = None,
+        match_source: str | None = None,
+        keyword_hit: bool = False,
+        vector_match_attempted: bool = False,
+        vector_candidates: list[dict[str, Any]] | None = None,
+        final_branch: str | None = None,
+        fallback_reason: str | None = None,
+        confidence: float | None = None,
+        threshold: float | None = None,
+        gap_score: float | None = None,
+    ) -> None:
+        payload = {
+            "call_id": self.call_id,
+            "event": "intent",
+            "intent_id": intent_id,
+            "uuid": self.uuid,
+            "matched_text": matched_text,
+            "asr_final_text": asr_final_text,
+            "normalized_text": normalized_text,
+            "match_source": match_source,
+            "keyword_hit": keyword_hit,
+            "vector_match_attempted": vector_match_attempted,
+            "vector_candidates": vector_candidates or [],
+            "final_branch": final_branch,
+            "fallback_reason": fallback_reason,
+            "confidence": confidence,
+            "threshold": threshold,
+            "gap_score": gap_score,
+        }
+        await self._post(cfg.get("monitor_intent_url"), payload, "monitor intent", timeout=3.0)
+
     async def _send_transcript(self, text: str) -> None:
         payload = {
             "call_id": self.call_id,
-            "event": "transcript",
+            "event": "asr",
             "uuid": self.uuid,
             "text": text,
         }
-        await self._post(cfg.get("transcript_url"), payload, "transcript", timeout=3.0)
-        logger.info(f"call_id={self.call_id} transcript={text} 发送文本识别消息={cfg.get("transcript_url")}")
+        await self._post(cfg.get("monitor_asr_url"), payload, "monitor asr", timeout=3.0)
+        logger.info(
+            "call_id=%s transcript=%s 发送文本识别消息=%s",
+            self.call_id,
+            text,
+            cfg.get("monitor_asr_url"),
+        )
+
+    async def send_monitor_event(self, event: str, text: str | None = None, **extra: Any) -> None:
+        payload: dict[str, Any] = {
+            "call_id": self.call_id,
+            "event": event,
+            "uuid": self.uuid,
+        }
+        if text:
+            payload["text"] = text
+        payload.update(extra)
+        await self._post(cfg.get("monitor_event_url"), payload, f"monitor event {event}", timeout=3.0)
 
     async def _send_interrupt(self) -> None:
         payload = {

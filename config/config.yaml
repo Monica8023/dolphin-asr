@@ -2,6 +2,9 @@ intent_service_url: "http://127.0.0.1:8808"
 business_callback_url: "http://127.0.0.1:9000/callback"
 interrupt_url: "http://127.0.0.1:9000/interrupt"
 transcript_url: "http://127.0.0.1:9000/transcript"
+monitor_event_url: "http://127.0.0.1:9000/monitor-event"
+monitor_intent_url: "http://127.0.0.1:9000/monitor-intent"
+monitor_asr_url: "http://127.0.0.1:9000/monitor-asr"
 
 # VAD 打断：检测到连续说话超过此时长触发无意图打断
 vad_interrupt_threshold_ms: 2000
@@ -29,9 +32,9 @@ offline_asr_model_path: "D:/model/iic/funasr_finetune_offline"
 asr_device: "cpu"
 # 流式推理分块参数：[lookback, current, lookahead]（单位：LFR 帧，1帧≈60ms）
 # current=2 → chunk_stride=960 samples=60ms，首词延迟从 ~240ms 降至 ~120ms
-asr_chunk_size: [0, 2, 1]
-asr_encoder_chunk_look_back: 7
-asr_decoder_chunk_look_back: 1
+asr_chunk_size: [0, 4, 1]
+asr_encoder_chunk_look_back: 2
+asr_decoder_chunk_look_back: 0
 intent_epoch_guard_enabled: true
 # ONNX Runtime 线程数：GPU 环境建议 1，避免与在线ASR线程池叠加导致CPU过度订阅
 asr_num_threads: 1
