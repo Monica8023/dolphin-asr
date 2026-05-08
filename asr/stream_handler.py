@@ -74,6 +74,7 @@ class StreamHandler:
         self._noise_gate_filter_chars: set[str] = set(cfg.get("noise_gate_filter_chars", ["嗯", "喂"]))
         self._noise_gate_lookback_ms: int = cfg.get("noise_gate_lookback_ms", 180)
         self._interrupt_ignore_start_ms: int = 0   # 开启后前 N ms 禁止打断
+        self._interrupt_ignore_end_ms: int = 0     # 结束前 N ms 禁止打断
         self._word_count: int | None = 2
         self._question_similarity: float | None = None
 
@@ -115,8 +116,16 @@ class StreamHandler:
         self._first_text_received: bool = False
         self._no_answer_sent: bool = False
 
-        # 打断前置禁区：resume() 时记录起始时刻
+        # start/resume 后的计时器起始延迟窗，仅用于 no_answer / match timeout。
+        self._timer_allow_after: float = 0.0
+        # 当前播报句的打断保护窗口，基于 send_text 到达时的 monotonic 时钟计算。
+        self._interrupt_sentence_started_at: float = 0.0
         self._interrupt_allow_after: float = 0.0
+        self._interrupt_deny_after: float = 0.0
+        self._interrupt_sentence_end_at: float = 0.0
+        self._pending_interrupt: bool = False
+        self._pending_intents: deque[dict[str, Any]] = deque()
+        self._pending_event_flush_task: asyncio.Task | None = None
 
     def start_timers(self) -> None:
         """连接建立后调用，启动无应答计时器。"""
@@ -124,7 +133,7 @@ class StreamHandler:
 
     def _timer_start_delay_s(self) -> float:
         """统一计时器起始延迟窗：start 事件后的 ignore_start_seconds。"""
-        return max(0.0, self._interrupt_allow_after - time.monotonic())
+        return max(0.0, self._timer_allow_after - time.monotonic())
 
     def stop_timers(self) -> None:
         """连接断开或流程结束时调用。"""
@@ -152,6 +161,7 @@ class StreamHandler:
         self._paused = True
         self._no_answer_sent = False
         self._reset_sentence_state(reset_interrupt=True)
+        self._clear_interrupt_protection()
 
     def resume(self) -> None:
         """由 start 事件调用：重置状态并重新启动计时器。"""
@@ -159,8 +169,9 @@ class StreamHandler:
         self._paused = False
         self._no_answer_sent = False
         self._reset_sentence_state(reset_interrupt=True)
-        # 记录打断禁区截止时刻
-        self._interrupt_allow_after = time.monotonic() + self._interrupt_ignore_start_ms / 1000
+        self._clear_interrupt_protection()
+        # 仅控制 start/resume 后计时器的起始延迟；真正的打断保护窗由 send_text 单独驱动。
+        self._timer_allow_after = time.monotonic() + self._interrupt_ignore_start_ms / 1000
         self.start_timers()
 
     def load_conf(self, call_conf: dict) -> None:
@@ -220,6 +231,21 @@ class StreamHandler:
                             self.model_id,
                             start_ignore_seconds,
                             self._interrupt_ignore_start_ms,
+                        )
+
+                end_ignore_seconds = interrupt_cfg.get("endIgnoreSeconds")
+                if end_ignore_seconds is not None:
+                    try:
+                        parsed_end_ignore_seconds = float(end_ignore_seconds)
+                        if parsed_end_ignore_seconds >= 0:
+                            self._interrupt_ignore_end_ms = int(parsed_end_ignore_seconds * 1000)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "call_id=%s model_id=%s invalid endIgnoreSeconds=%r, keep previous=%s",
+                            self.call_id,
+                            self.model_id,
+                            end_ignore_seconds,
+                            self._interrupt_ignore_end_ms,
                         )
 
                 silence_tolerance_ms = interrupt_cfg.get("silenceToleranceMs")
@@ -371,17 +397,18 @@ class StreamHandler:
             silence_tolerance_ms=self._interrupt_silence_tolerance_ms,
         )
         logger.info(
-            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms interrupt_tolerance=%dms interrupt_rnnoise_prob=%.2f type_threshold=%s question_similarity=%s",
+            "call_id=%s model_id=%s conf loaded: silence=%dms no_answer=%dms interrupt=%s/%dms ignore_start=%dms ignore_end=%dms interrupt_tolerance=%dms interrupt_rnnoise_prob=%.2f type_threshold=%s question_similarity=%s",
             self.call_id, self.model_id,
             self._silence_max_ms, self._no_answer_timeout_ms,
             self._interrupt_enabled, self._interrupt_threshold_ms,
-            self._interrupt_ignore_start_ms, self._interrupt_silence_tolerance_ms,
+            self._interrupt_ignore_start_ms, self._interrupt_ignore_end_ms, self._interrupt_silence_tolerance_ms,
             self._interrupt_rnnoise_vad_prob, self._word_count,self._question_similarity
         )
 
     def _reset_sentence_state(self, reset_interrupt: bool = False, reset_models: bool = True) -> None:
         """每句话处理完毕后调用，重置句子级状态，允许持续识别下一句。"""
         self._sentence_parts = []
+        self._sentence_start_ms = 0
         self._in_speech = False
         self._last_speech_end_ms = None
         self._audio_lookback.clear()
@@ -397,6 +424,151 @@ class StreamHandler:
         else:
             self._vad.reset_detection_state()
         self._denoiser.reset()
+
+    def _clear_interrupt_protection(self) -> None:
+        self._interrupt_sentence_started_at = 0.0
+        self._interrupt_allow_after = 0.0
+        self._interrupt_deny_after = 0.0
+        self._interrupt_sentence_end_at = 0.0
+        if self._has_pending_events():
+            self._restart_pending_event_flush_task()
+
+    def update_interrupt_protection(self, total_ms: int) -> None:
+        """收到 send_text 后，根据句子总时长重建当前播报句的前后打断禁区。"""
+        normalized_total_ms = max(0, int(total_ms))
+        started_at = time.monotonic()
+        sentence_end_at = started_at + normalized_total_ms / 1000
+        allow_after = started_at + self._interrupt_ignore_start_ms / 1000
+        deny_after = max(started_at, sentence_end_at - self._interrupt_ignore_end_ms / 1000)
+        self._interrupt_sentence_started_at = started_at
+        self._interrupt_allow_after = allow_after
+        self._interrupt_deny_after = deny_after
+        self._interrupt_sentence_end_at = sentence_end_at
+        logger.debug(
+            "call_id=%s interrupt protection updated: total_ms=%d start_protect_until=%.3f end_protect_from=%.3f sentence_end_at=%.3f",
+            self.call_id,
+            normalized_total_ms,
+            self._interrupt_allow_after,
+            self._interrupt_deny_after,
+            self._interrupt_sentence_end_at,
+        )
+        if self._has_pending_events():
+            self._restart_pending_event_flush_task()
+
+    @staticmethod
+    def _overlap_seconds(start1: float, end1: float, start2: float, end2: float) -> float:
+        return max(0.0, min(end1, end2) - max(start1, start2))
+
+    def _has_pending_events(self) -> bool:
+        return self._pending_interrupt or bool(self._pending_intents)
+
+    def _is_in_interrupt_protection(self, now: float | None = None) -> bool:
+        if self._interrupt_sentence_end_at <= 0:
+            return False
+        ts = time.monotonic() if now is None else now
+        if ts < self._interrupt_allow_after and ts < self._interrupt_sentence_end_at:
+            return True
+        if self._interrupt_deny_after <= ts < self._interrupt_sentence_end_at:
+            return True
+        return False
+
+    def _next_interrupt_release_at(self, now: float | None = None) -> float:
+        ts = time.monotonic() if now is None else now
+        if self._interrupt_sentence_end_at <= 0:
+            return ts
+        if ts < self._interrupt_allow_after and ts < self._interrupt_sentence_end_at:
+            if self._interrupt_allow_after < self._interrupt_deny_after and self._interrupt_allow_after < self._interrupt_sentence_end_at:
+                return self._interrupt_allow_after
+            return self._interrupt_sentence_end_at
+        if self._interrupt_deny_after <= ts < self._interrupt_sentence_end_at:
+            return self._interrupt_sentence_end_at
+        return ts
+
+    def _restart_pending_event_flush_task(self) -> None:
+        if not self._has_pending_events():
+            return
+        task = self._pending_event_flush_task
+        if task and not task.done():
+            task.cancel()
+        self._pending_event_flush_task = asyncio.create_task(self._flush_pending_events_when_unprotected())
+
+    async def _flush_pending_events_when_unprotected(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while self._has_pending_events():
+                now = time.monotonic()
+                if self._is_in_interrupt_protection(now):
+                    release_at = self._next_interrupt_release_at(now)
+                    await asyncio.sleep(max(0.0, release_at - now))
+                    continue
+                await self._flush_pending_events()
+        finally:
+            if self._pending_event_flush_task is current_task:
+                self._pending_event_flush_task = None
+
+    async def _flush_pending_events(self) -> None:
+        if self._is_in_interrupt_protection():
+            return
+        if self._pending_interrupt:
+            self._pending_interrupt = False
+            await self._send_interrupt()
+        while self._pending_intents and not self._is_in_interrupt_protection():
+            intent_payload = self._pending_intents.popleft()
+            await self._send_intent_hit(intent_payload)
+
+    def _emit_interrupt_or_defer(self) -> None:
+        if self._is_in_interrupt_protection():
+            self._pending_interrupt = True
+            logger.info("call_id=%s interrupt deferred until protection window ends", self.call_id)
+            self._restart_pending_event_flush_task()
+            return
+        self._create_safe_task(self._send_interrupt())
+
+    def _emit_intent_or_defer(self, intent_payload: dict[str, Any]) -> None:
+        intent_id = str(intent_payload.get("intent_id", "intent_unknown"))
+        if self._is_in_interrupt_protection():
+            self._pending_intents.append(intent_payload)
+            logger.info("call_id=%s intent_id=%s deferred until protection window ends", self.call_id, intent_id)
+            self._restart_pending_event_flush_task()
+            return
+        self._create_safe_task(self._send_intent_hit(intent_payload))
+
+    def _interrupt_effective_chunk_ms(self, chunk_ms: int, chunk_end_at: float) -> int:
+        if chunk_ms <= 0:
+            return 0
+        if self._interrupt_sentence_end_at <= 0:
+            return max(0, int(chunk_ms))
+
+        chunk_duration_s = max(0.0, chunk_ms / 1000)
+        chunk_start_at = chunk_end_at - chunk_duration_s
+        if chunk_start_at >= self._interrupt_sentence_end_at:
+            self._clear_interrupt_protection()
+            return max(0, int(chunk_ms))
+        protected_s = 0.0
+
+        protected_s += self._overlap_seconds(
+            chunk_start_at,
+            chunk_end_at,
+            self._interrupt_sentence_started_at,
+            self._interrupt_allow_after,
+        )
+        protected_s += self._overlap_seconds(
+            chunk_start_at,
+            chunk_end_at,
+            self._interrupt_deny_after,
+            self._interrupt_sentence_end_at,
+        )
+        protected_s -= self._overlap_seconds(
+            chunk_start_at,
+            chunk_end_at,
+            max(self._interrupt_sentence_started_at, self._interrupt_deny_after),
+            min(self._interrupt_allow_after, self._interrupt_sentence_end_at),
+        )
+
+        allowed_ms = int(round(max(0.0, chunk_duration_s - protected_s) * 1000))
+        if chunk_end_at >= self._interrupt_sentence_end_at:
+            self._clear_interrupt_protection()
+        return min(max(allowed_ms, 0), max(0, int(chunk_ms)))
 
     async def close(self) -> None:
         """连接断开时调用：刷新模型内部缓冲区，处理最后一帧剩余文本。"""
@@ -473,7 +645,8 @@ class StreamHandler:
         # 1.5 打断检测（基于 step1 的 VAD + RNNoise 概率，不重复跑 VAD）
         interrupt_speech = bool(is_speech or rnnoise_vad_prob >= self._interrupt_rnnoise_vad_prob)
         if self._interrupt_enabled:
-            in_ignore_window = time.monotonic() < self._interrupt_allow_after
+            interrupt_chunk_ms = self._interrupt_effective_chunk_ms(chunk_ms, time.monotonic())
+            in_ignore_window = interrupt_chunk_ms <= 0
             if in_ignore_window:
                 logger.debug("call_id=%s step1.5 interrupt check skipped: in ignore window", self.call_id)
                 # 仍需驱动 process_speech 以维护语音/静音边界，但 ignore 窗口内不累计打断时长。
@@ -486,19 +659,19 @@ class StreamHandler:
                     is_speech,
                     rnnoise_vad_prob,
                     self._interrupt_rnnoise_vad_prob,
-                    chunk_ms,
+                    interrupt_chunk_ms,
                 )
                 should_interrupt = await loop.run_in_executor(
                     self._vad_executor,
                     self._vad.process_speech,
                     interrupt_speech,
-                    chunk_ms,
+                    interrupt_chunk_ms,
                 )
                 logger.debug("call_id=%s step1.5 interrupt check result: should_interrupt=%s", self.call_id,
                              should_interrupt)
                 if should_interrupt:
                     logger.info("call_id=%s step1.5 interrupt triggered", self.call_id)
-                    self._create_safe_task(self._send_interrupt())
+                    self._emit_interrupt_or_defer()
         else:
             logger.debug("call_id=%s step1.5 interrupt check skipped: interrupt_enabled=false", self.call_id)
         _t3 = time.monotonic()
@@ -590,7 +763,6 @@ class StreamHandler:
                     sentence = "".join(self._sentence_parts)
 
                     self._sentence_parts = []
-                    self._sentence_start_ms = end_ms
                     self._in_speech = False
                     self._last_speech_end_ms = None
                     self._sentence_epoch += 1
@@ -677,31 +849,42 @@ class StreamHandler:
             sentence_epoch,
         )
 
-        monitor_task = self._send_monitor_intent(
-            intent_id=intent_id,
-            matched_text=matched_text,
-            asr_final_text=sentence,
-            normalized_text=normalized_text,
-            match_source=match_source,
-            keyword_hit=keyword_hit,
-            vector_match_attempted=vector_match_attempted,
-            vector_candidates=vector_candidates,
-            final_branch=final_branch,
-            fallback_reason=fallback_reason,
-            confidence=confidence,
-            threshold=threshold,
-            gap_score=gap_score,
-        )
+        intent_payload: dict[str, Any] = {
+            "intent_id": intent_id,
+            "sentence": sentence,
+            "matched_text": matched_text,
+            "normalized_text": normalized_text,
+            "match_source": match_source,
+            "keyword_hit": keyword_hit,
+            "vector_match_attempted": vector_match_attempted,
+            "vector_candidates": vector_candidates,
+            "final_branch": final_branch,
+            "fallback_reason": fallback_reason,
+            "confidence": confidence,
+            "threshold": threshold,
+            "gap_score": gap_score,
+        }
 
         if intent_id != "intent_unknown":
             self._cancel_match_timeout_timer()
-            await asyncio.gather(
-                self._send_callback(intent_id, sentence),
-                monitor_task,
+            self._emit_intent_or_defer(intent_payload)
+            await self._send_monitor_intent(
+                intent_id=intent_id,
+                matched_text=matched_text,
+                asr_final_text=sentence,
+                normalized_text=normalized_text,
+                match_source=match_source,
+                keyword_hit=keyword_hit,
+                vector_match_attempted=vector_match_attempted,
+                vector_candidates=vector_candidates,
+                final_branch=final_branch,
+                fallback_reason=fallback_reason,
+                confidence=confidence,
+                threshold=threshold,
+                gap_score=gap_score,
             )
             return
 
-        await monitor_task
 
     # ------------------------------------------------------------------ #
     #  对外推送                                                             #
@@ -716,6 +899,29 @@ class StreamHandler:
             "text": text,
         }
         await self._post(cfg.get("business_callback_url"), payload, "intent callback")
+
+    async def _send_intent_hit(self, intent_payload: dict[str, Any]) -> None:
+        await asyncio.gather(
+            self._send_callback(
+                str(intent_payload.get("intent_id", "intent_unknown")),
+                str(intent_payload.get("sentence", "")),
+            ),
+            self._send_monitor_intent(
+                intent_id=str(intent_payload.get("intent_id", "intent_unknown")),
+                matched_text=str(intent_payload.get("matched_text", "")),
+                asr_final_text=str(intent_payload.get("sentence", "")),
+                normalized_text=intent_payload.get("normalized_text"),
+                match_source=intent_payload.get("match_source"),
+                keyword_hit=bool(intent_payload.get("keyword_hit", False)),
+                vector_match_attempted=bool(intent_payload.get("vector_match_attempted", False)),
+                vector_candidates=intent_payload.get("vector_candidates"),
+                final_branch=intent_payload.get("final_branch"),
+                fallback_reason=intent_payload.get("fallback_reason"),
+                confidence=intent_payload.get("confidence"),
+                threshold=intent_payload.get("threshold"),
+                gap_score=intent_payload.get("gap_score"),
+            ),
+        )
 
     async def _send_monitor_intent(
         self,

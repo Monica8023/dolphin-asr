@@ -94,6 +94,69 @@ async def _load_model_conf(redis_client: aioredis.Redis, model_id: int) -> dict:
     return {}
 
 
+def _extract_ws_event_name(data: dict) -> str | None:
+    for key in ("control", "event", "type"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _parse_duration_ms(value: object) -> int | None:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric < 0:
+            return None
+        return int(numeric) if numeric >= 1000 else int(numeric * 1000)
+
+    if not isinstance(value, str):
+        return None
+
+    raw = value.strip().lower()
+    if not raw:
+        return None
+
+    multiplier = 1000.0
+    if raw.endswith("ms"):
+        raw = raw[:-2].strip()
+        multiplier = 1.0
+    elif raw.endswith("s"):
+        raw = raw[:-1].strip()
+
+    try:
+        numeric = float(raw)
+    except ValueError:
+        return None
+    if numeric < 0:
+        return None
+    if multiplier == 1000.0 and numeric >= 1000:
+        return int(numeric)
+    return int(numeric * multiplier)
+
+
+def _extract_send_text_total_ms(data: dict) -> int | None:
+    payloads: list[dict] = []
+    nested_data = data.get("data")
+    if isinstance(nested_data, dict):
+        payloads.append(nested_data)
+    payloads.append(data)
+
+    for payload in payloads:
+        channels = payload.get("channel")
+        if not isinstance(channels, list):
+            continue
+        for item in channels:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("key", "")).strip().lower() != "total":
+                continue
+            return _parse_duration_ms(item.get("value"))
+    return None
+
+
 async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: str, call_id: str) -> bool:
     """处理文本事件帧，返回是否需要结束 ws 循环。"""
     preview = raw if len(raw) <= 200 else f"{raw[:200]}..."
@@ -115,7 +178,7 @@ async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: st
         )
         return False
 
-    event = data.get("control")
+    event = _extract_ws_event_name(data)
     if event == "start":
         logger.info("call_id=%s event=start: ASR resumed", call_id)
         call_conf = await _load_model_conf(websocket.app.state.redis, handler.model_id)
@@ -131,6 +194,15 @@ async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: st
     if event == "pause":
         logger.info("call_id=%s event=pause: ASR paused", call_id)
         handler.pause()
+        return False
+
+    if event == "send_text":
+        total_ms = _extract_send_text_total_ms(data)
+        if total_ms is None:
+            logger.warning("call_id=%s event=send_text missing valid channel.total: preview=%r", call_id, preview)
+            return False
+        handler.update_interrupt_protection(total_ms)
+        logger.info("call_id=%s event=send_text: interrupt protection updated total_ms=%d", call_id, total_ms)
         return False
 
     if event == "stop":
@@ -216,7 +288,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
 
             if text is not None:
                 try:
-                    event = json.loads(text).get("control")
+                    event = _extract_ws_event_name(json.loads(text))
                 except ValueError:
                     event = None
 
@@ -229,7 +301,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                     stream_active = False
                     await _drain_audio_queue(audio_queue)
 
-                if event in {"start", "resume", "pause", "stop"}:
+                if event in {"start", "resume", "pause", "stop", "send_text"}:
                     handler.emit_monitor_event(f"ws_{event}", text=f"control={event}")
 
                 if should_close:
