@@ -11,8 +11,6 @@ logger = logging.getLogger("dolphin.nacos_config")
 DEFAULT_CONFIG = {
     "intent_service_url": "http://127.0.0.1:8808",
     "business_callback_url": "http://127.0.0.1:9000/callback",
-    "interrupt_url": "http://127.0.0.1:9000/interrupt",
-    "transcript_url": "http://127.0.0.1:9000/transcript",
     "monitor_event_url": "http://127.0.0.1:9000/monitor-event",
     "monitor_intent_url": "http://127.0.0.1:9000/monitor-intent",
     "monitor_asr_url": "http://127.0.0.1:9000/monitor-asr",
@@ -25,12 +23,8 @@ DEFAULT_CONFIG = {
     "log_level": "info",
     "asr_model_path": "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
     "vad_model_path": "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-    "enhancer_model_path": "D:/model/iic/speech_zipenhancer_ans_multiloss_16k_base",
     "offline_asr_model_path":"D:/model/iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
     "asr_device": "cpu",
-    "asr_chunk_size": [0, 6, 2],
-    "asr_encoder_chunk_look_back": 2,
-    "asr_decoder_chunk_look_back": 0,
     "intent_epoch_guard_enabled": True,
     "asr_workers": 8,
     "vad_workers": 4,
@@ -38,7 +32,6 @@ DEFAULT_CONFIG = {
     "vad_gate_asr": False,
     "audio_queue_maxsize": 64,
     "audio_input_sample_rate": 16000,
-    "audio_input_codec": "pcm16",
 }
 
 _config: dict[str, Any] = {}

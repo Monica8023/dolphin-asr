@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from typing import NamedTuple
@@ -15,12 +16,12 @@ from config import nacos_config as cfg
 from log_config import setup_logging
 from asr.engine import load_model
 from asr.vad import load_vad_model
-from asr.offline_engine import load_offline_model
 from asr.stream_handler import StreamHandler
 
 logger = logging.getLogger(__name__)
 
 _AUDIO_QUEUE_SENTINEL = object()
+_AudioQueueItem = tuple[bytes, float]
 
 class _Executors(NamedTuple):
     vad: ThreadPoolExecutor
@@ -215,7 +216,7 @@ async def _handle_ws_event(websocket: WebSocket, handler: StreamHandler, raw: st
     return False
 
 
-async def _drain_audio_queue(audio_queue: asyncio.Queue[bytes | object]) -> None:
+async def _drain_audio_queue(audio_queue: asyncio.Queue[_AudioQueueItem | object]) -> None:
     while True:
         try:
             audio_queue.get_nowait()
@@ -224,21 +225,29 @@ async def _drain_audio_queue(audio_queue: asyncio.Queue[bytes | object]) -> None
             return
 
 
-async def _audio_consumer_loop(handler: StreamHandler, audio_queue: asyncio.Queue[bytes | object]) -> None:
+async def _audio_consumer_loop(handler: StreamHandler, audio_queue: asyncio.Queue[_AudioQueueItem | object]) -> None:
     while True:
         item = await audio_queue.get()
         try:
             if item is _AUDIO_QUEUE_SENTINEL:
                 return
             try:
-                await handler.handle_audio(item)
+                if isinstance(item, (bytes, bytearray)):
+                    audio_bytes = bytes(item)
+                    received_at = None
+                elif isinstance(item, tuple) and len(item) == 2:
+                    audio_bytes, received_at = item
+                else:
+                    logger.warning("Audio consumer received unexpected queue item type=%s", type(item).__name__)
+                    continue
+                await handler.handle_audio(audio_bytes, received_at=received_at)
             except Exception as e:
                 logger.error("Audio consumer frame handling failed: %s", e, exc_info=True)
         finally:
             audio_queue.task_done()
 
 
-def _enqueue_sentinel(audio_queue: asyncio.Queue[bytes | object]) -> None:
+def _enqueue_sentinel(audio_queue: asyncio.Queue[_AudioQueueItem | object]) -> None:
     try:
         audio_queue.put_nowait(_AUDIO_QUEUE_SENTINEL)
         return
@@ -269,7 +278,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
         asr_executor=websocket.app.state.executor.asr,
     )
     queue_maxsize = max(1, int(cfg.get("audio_queue_maxsize", 64)))
-    audio_queue: asyncio.Queue[bytes | object] = asyncio.Queue(maxsize=queue_maxsize)
+    audio_queue: asyncio.Queue[_AudioQueueItem | object] = asyncio.Queue(maxsize=queue_maxsize)
     consumer_task = asyncio.create_task(_audio_consumer_loop(handler, audio_queue))
     stream_active = False
 
@@ -309,24 +318,24 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                 continue
 
             if audio_bytes is not None:
+                received_at = time.monotonic()
                 input_sample_rate = int(getattr(handler, "_audio_input_sample_rate", cfg.get("audio_input_sample_rate", 16000)))
-                input_codec = "pcm16"
                 bytes_per_sample = 2
                 num_samples = len(audio_bytes) // bytes_per_sample
                 chunk_ms = int(num_samples / input_sample_rate * 1000) if input_sample_rate > 0 else 0
                 logger.debug(
-                    "call_id=%s ws audio frame received: bytes=%d samples=%d sample_rate=%d codec=%s chunk_ms=%d",
+                    "call_id=%s ws audio frame received: bytes=%d samples=%d sample_rate=%d chunk_ms=%d",
                     call_id,
                     len(audio_bytes),
                     num_samples,
                     input_sample_rate,
-                    input_codec,
                     chunk_ms,
                 )
                 if not stream_active:
                     continue
+                queue_item: _AudioQueueItem = (audio_bytes, received_at)
                 try:
-                    audio_queue.put_nowait(audio_bytes)
+                    audio_queue.put_nowait(queue_item)
                 except asyncio.QueueFull:
                     try:
                         dropped = audio_queue.get_nowait()
@@ -336,7 +345,7 @@ async def ws_asr(websocket: WebSocket, call_id: str, uuid: str, model_id: int = 
                     except asyncio.QueueEmpty:
                         pass
                     try:
-                        audio_queue.put_nowait(audio_bytes)
+                        audio_queue.put_nowait(queue_item)
                     except asyncio.QueueFull:
                         logger.debug("call_id=%s audio frame dropped due to full queue", call_id)
                 continue

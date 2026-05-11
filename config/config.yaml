@@ -1,7 +1,5 @@
 intent_service_url: "http://127.0.0.1:8808"
 business_callback_url: "http://127.0.0.1:9000/callback"
-interrupt_url: "http://127.0.0.1:9000/interrupt"
-transcript_url: "http://127.0.0.1:9000/transcript"
 monitor_event_url: "http://127.0.0.1:9000/monitor-event"
 monitor_intent_url: "http://127.0.0.1:9000/monitor-intent"
 monitor_asr_url: "http://127.0.0.1:9000/monitor-asr"
@@ -30,17 +28,11 @@ asr_model_path: "D:/model/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-v
 vad_model_path: "D:/model/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 offline_asr_model_path: "D:/model/iic/funasr_finetune_offline"
 asr_device: "cpu"
-# 流式推理分块参数：[lookback, current, lookahead]（单位：LFR 帧，1帧≈60ms）
-# current=2 → chunk_stride=960 samples=60ms，首词延迟从 ~240ms 降至 ~120ms
-asr_chunk_size: [0, 4, 1]
-asr_encoder_chunk_look_back: 2
-asr_decoder_chunk_look_back: 0
 intent_epoch_guard_enabled: true
 # ONNX Runtime 线程数：GPU 环境建议 1，避免与在线ASR线程池叠加导致CPU过度订阅
 asr_num_threads: 1
 asr_workers: 8
 vad_workers: 4
-enhancer_workers: 2
 # RNNoise + VAD 的轻量噪声门限：连续弱语音帧且仅识别出“嗯/喂”等短拟声词时丢弃
 noise_gate_rnnoise_vad_prob: 0.45
 noise_gate_min_speech_frames: 2
@@ -50,9 +42,6 @@ noise_gate_filter_chars: ["嗯", "喂"]
 online_asr_workers: 4
 # 离线 ASR 专用线程池（整句重任务，独立不影响流式 ASR 时延）
 offline_asr_workers: 4
-# enhancer 缓冲阈值（samples @ 16kHz）：从 3200(200ms) 降至 1600(100ms)，降低首字前置等待
-# 灰度验证无质量下降后可继续降至 800(50ms)
-enhancer_buffer_samples: 1600
 
 # 每路连接的音频收包队列长度（帧数），用于“收包与在线ASR异步解耦”
 audio_queue_maxsize: 64
@@ -63,5 +52,3 @@ vad_gate_asr: false
 # 输入音频采样率（Hz）：8000=正式环境 8kHz，16000=测试环境 16kHz
 # 非 16000 时自动上采样到 16kHz 再送入各模型；已是 16kHz 则直接透传
 audio_input_sample_rate: 8000
-# 输入音频编码：pcm16 / pcmu / pcma
-audio_input_codec: "pcm16"
